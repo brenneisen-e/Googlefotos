@@ -8,8 +8,12 @@ repairs EXIF metadata, renames files, detects duplicates, and generates reports.
 
 import argparse
 import logging
+import math
+import random
+import shutil
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from rich.console import Console
@@ -19,7 +23,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from tqdm import tqdm
 
 from modules.extractor import extract_all
-from modules.matcher import match_all
+from modules.matcher import match_all, find_json_for_media
 from modules.metadata import (
     check_exiftool,
     process_file,
@@ -73,6 +77,10 @@ def parse_args():
         "--skip-extraction", action="store_true",
         help="Skip ZIP extraction (use if already extracted to temp)",
     )
+    parser.add_argument(
+        "--sample", type=int, default=None, metavar="N",
+        help="Randomly sample N files for a test run (e.g. --sample 500)",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +96,116 @@ def scan_media_files(temp_dir: str) -> list:
     return sorted(media_files)
 
 
+def create_sample(
+    media_files: list,
+    sample_size: int,
+    temp_dir: str,
+    sample_dir: str,
+) -> list:
+    """Create a stratified random sample of media files.
+
+    Selects files proportionally across subfolders so all years/albums
+    are represented. Copies sampled media files + their JSON sidecars
+    into sample_dir, preserving subfolder structure.
+
+    Returns list of sampled media Paths (inside sample_dir).
+    """
+    random.seed(42)
+    temp_path = Path(temp_dir)
+    sample_path = Path(sample_dir)
+
+    # Clean up any previous sample
+    if sample_path.exists():
+        shutil.rmtree(sample_path)
+    sample_path.mkdir(parents=True, exist_ok=True)
+
+    # Group files by their immediate subfolder relative to temp_dir
+    groups = defaultdict(list)
+    for mf in media_files:
+        try:
+            rel = mf.relative_to(temp_path)
+            # Use the top-level subfolder as the stratum key
+            parts = rel.parts
+            key = parts[0] if len(parts) > 1 else "."
+        except ValueError:
+            key = "."
+        groups[key].append(mf)
+
+    # Cap sample_size to total available
+    total = len(media_files)
+    sample_size = min(sample_size, total)
+
+    # Stratified sampling: allocate proportionally, at least 1 per group
+    sampled = []
+
+    # Sort groups for reproducibility
+    sorted_keys = sorted(groups.keys())
+    allocations = {}
+
+    for key in sorted_keys:
+        count = len(groups[key])
+        alloc = max(1, math.floor(sample_size * count / total))
+        allocations[key] = min(alloc, count)
+
+    # Adjust if we over-allocated
+    total_alloc = sum(allocations.values())
+    if total_alloc > sample_size:
+        # Trim from largest groups
+        for key in sorted(allocations, key=lambda k: allocations[k], reverse=True):
+            excess = total_alloc - sample_size
+            if excess <= 0:
+                break
+            trim = min(excess, allocations[key] - 1)
+            allocations[key] -= trim
+            total_alloc -= trim
+
+    # Distribute remaining slots to largest groups
+    total_alloc = sum(allocations.values())
+    if total_alloc < sample_size:
+        deficit = sample_size - total_alloc
+        for key in sorted(allocations, key=lambda k: len(groups[k]), reverse=True):
+            can_add = len(groups[key]) - allocations[key]
+            add = min(deficit, can_add)
+            allocations[key] += add
+            deficit -= add
+            if deficit <= 0:
+                break
+
+    # Sample from each group
+    for key in sorted_keys:
+        group_files = groups[key]
+        n = allocations.get(key, 0)
+        chosen = random.sample(group_files, min(n, len(group_files)))
+        sampled.extend(chosen)
+
+    # Copy sampled files + their JSON sidecars to sample_dir
+    sampled_in_sample_dir = []
+    for mf in sampled:
+        try:
+            rel = mf.relative_to(temp_path)
+        except ValueError:
+            rel = Path(mf.name)
+
+        dest = sample_path / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(mf), str(dest))
+
+        # Find and copy JSON sidecar
+        json_path = find_json_for_media(mf)
+        if json_path and json_path.exists():
+            try:
+                json_rel = json_path.relative_to(temp_path)
+            except ValueError:
+                json_rel = Path(json_path.name)
+            json_dest = sample_path / json_rel
+            json_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(json_path), str(json_dest))
+
+        sampled_in_sample_dir.append(dest)
+
+    return sorted(sampled_in_sample_dir)
+
+
 def print_config(args, exiftool_ok: bool):
     """Print startup configuration summary."""
     table = Table(title="Configuration", show_header=False, border_style="blue")
@@ -101,6 +219,8 @@ def print_config(args, exiftool_ok: bool):
     table.add_row("Skip duplicates", str(args.skip_duplicates))
     table.add_row("Skip extraction", str(args.skip_extraction))
     table.add_row("ExifTool available", "Yes" if exiftool_ok else "No")
+    if args.sample:
+        table.add_row("Sample mode", f"{args.sample} files (seed=42)")
     console.print(table)
     console.print()
 
@@ -198,8 +318,32 @@ def main():
         console.print("[yellow]No media files found. Nothing to do.[/yellow]")
         sys.exit(0)
 
+    # ------------------------------------------------------------------
+    # Sample mode: pick N files, copy to temp_sample, redirect paths
+    # ------------------------------------------------------------------
+    is_sample = args.sample is not None
+    effective_temp = args.temp
+    effective_output = args.output
+
+    if is_sample:
+        sample_temp = "./temp_sample"
+        sample_output = "./output_sample"
+        console.print(Panel(
+            f"[bold yellow]SAMPLE MODE:[/bold yellow] Selecting {args.sample} "
+            f"of {len(media_files)} files (seed=42, stratified)",
+            border_style="yellow",
+        ))
+        sampled = create_sample(media_files, args.sample, args.temp, sample_temp)
+        console.print(
+            f"Sampled [bold]{len(sampled)}[/bold] files across "
+            f"{len(set(p.parent for p in sampled))} subfolders → {sample_temp}/\n"
+        )
+        media_files = sampled
+        effective_temp = sample_temp
+        effective_output = sample_output
+
     console.print("[dim]Matching JSON sidecars...[/dim]")
-    matched_files = match_all(media_files, args.temp)
+    matched_files = match_all(media_files, effective_temp)
     matched_count = sum(1 for _, j in matched_files if j is not None)
     unmatched_count = len(matched_files) - matched_count
 
@@ -274,7 +418,7 @@ def main():
     phase_num += 1
     print_phase("Rename & Copy to Output", phase_num, total_phases)
 
-    rename_results = rename_all(matched_files, process_results, args.temp, args.output)
+    rename_results = rename_all(matched_files, process_results, effective_temp, effective_output)
 
     copy_ok = sum(1 for r in rename_results if r["status"] == "ok")
     copy_fail = len(rename_results) - copy_ok
@@ -296,9 +440,10 @@ def main():
         phase_num += 1
         print_phase("Duplicate Detection", phase_num, total_phases)
 
+        db_name = "photos_sample.db" if is_sample else "photos.db"
         dup_results = run_duplicate_detection(
-            output_dir=args.output,
-            db_path="photos.db",
+            output_dir=effective_output,
+            db_path=db_name,
             phash_threshold=args.phash_threshold,
             dry_run=args.dry_run,
         )
@@ -323,10 +468,10 @@ def main():
 
     processing_time = time.time() - start_time
 
-    repair_log_path = write_repair_log(args.output, process_results, rename_results)
-    dupes_report_path = write_duplicates_report(args.output, exact_deletions, visual_deletions)
+    repair_log_path = write_repair_log(effective_output, process_results, rename_results)
+    dupes_report_path = write_duplicates_report(effective_output, exact_deletions, visual_deletions)
     summary_path = write_summary(
-        output_dir=args.output,
+        output_dir=effective_output,
         total_files=len(media_files),
         exif_written=exif_written_count,
         timestamps_set=timestamps_set_count,
@@ -361,8 +506,22 @@ def main():
     if args.dry_run:
         final_table.add_row("[yellow]Mode[/yellow]", "[yellow]DRY RUN[/yellow]")
 
+    if is_sample:
+        final_table.add_row("[yellow]Mode[/yellow]", f"[yellow]SAMPLE ({args.sample} files)[/yellow]")
+
     console.print(final_table)
-    console.print("\n[bold green]Done![/bold green]\n")
+
+    if is_sample:
+        console.print()
+        console.print(Panel(
+            "[bold yellow]TESTLAUF mit {n} Dateien abgeschlossen.\n"
+            "Starte den vollst\u00e4ndigen Export mit: python repair.py[/bold yellow]".format(
+                n=args.sample
+            ),
+            border_style="yellow",
+        ))
+    else:
+        console.print("\n[bold green]Done![/bold green]\n")
 
 
 if __name__ == "__main__":
