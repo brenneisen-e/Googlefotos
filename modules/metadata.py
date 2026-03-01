@@ -1,4 +1,17 @@
-"""EXIF writing and timestamp repair module."""
+"""EXIF writing and timestamp repair module.
+
+Timestamp priority (filename-first):
+  1. Parse from filename (highest trust – set by device at capture time)
+  2. Google JSON photoTakenTime / creationTime
+  3. Existing EXIF DateTimeOriginal
+  4. File modification time → marked as FLAG
+
+Cross-validation:
+  If filename-date AND json-date both exist and delta > 30 days,
+  log as "date_mismatch" (informational, filename date still wins).
+
+Files with no valid timestamp after all 4 steps → status "no_timestamp".
+"""
 
 import json
 import logging
@@ -7,7 +20,7 @@ import re
 import shutil
 import struct
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,24 +34,42 @@ EXIFTOOL_EXTENSIONS = {".heic", ".heif", ".mp4", ".mov", ".avi", ".m4v"}
 ALL_IMAGE_EXTENSIONS = EXIF_IMAGE_EXTENSIONS | {".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v", ".mkv", ".wmv", ".flv", ".3gp"}
 
-# Filename date patterns
+# Cross-validation threshold: if filename and JSON dates differ by more
+# than this many days, log as "date_mismatch".
+MISMATCH_THRESHOLD_DAYS = 30
+
+# ---------------------------------------------------------------------------
+# Filename date patterns (ordered most-specific first)
+# ---------------------------------------------------------------------------
 FILENAME_DATE_PATTERNS = [
-    # YYYYMMDD_HHMMSS
-    (re.compile(r"(\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # IMG_YYYYMMDD_HHMMSS (Android camera)
+    (re.compile(r"IMG[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # IMG-YYYYMMDD-WA0003 (WhatsApp)
+    (re.compile(r"IMG[_\-](\d{4})(\d{2})(\d{2})[_\-]WA\d+"), False),
+    # VID_YYYYMMDD_HHMMSS
+    (re.compile(r"VID[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # PXL_YYYYMMDD_HHMMSS (Pixel camera)
+    (re.compile(r"PXL[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # PANO_YYYYMMDD_HHMMSS (Panorama)
+    (re.compile(r"PANO[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # MVIMG_YYYYMMDD_HHMMSS (Motion photo)
+    (re.compile(r"MVIMG[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # Screenshot_YYYYMMDD-HHMMSS
+    (re.compile(r"Screenshot[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # signal-YYYY-MM-DD-HHMMSS (Signal Messenger)
+    (re.compile(r"signal[_\-](\d{4})-(\d{2})-(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # signal-YYYY-MM-DD-HH-MM-SS
+    (re.compile(r"signal[_\-](\d{4})-(\d{2})-(\d{2})[_\-](\d{2})-(\d{2})-(\d{2})"), True),
     # YYYY-MM-DD_HH-MM-SS
     (re.compile(r"(\d{4})-(\d{2})-(\d{2})[_\-](\d{2})-(\d{2})-(\d{2})"), True),
     # YYYY-MM-DD HH:MM:SS
     (re.compile(r"(\d{4})-(\d{2})-(\d{2})\s(\d{2}):(\d{2}):(\d{2})"), True),
-    # IMG_YYYYMMDD_HHMMSS
-    (re.compile(r"IMG[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
-    # VID_YYYYMMDD_HHMMSS
-    (re.compile(r"VID[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
-    # Screenshot_YYYYMMDD-HHMMSS
-    (re.compile(r"Screenshot[_\-](\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
+    # YYYYMMDD_HHMMSS (generic)
+    (re.compile(r"(\d{4})(\d{2})(\d{2})[_\-](\d{2})(\d{2})(\d{2})"), True),
     # YYYY-MM-DD only (no time)
     (re.compile(r"(\d{4})-(\d{2})-(\d{2})"), False),
-    # YYYYMMDD only (no time)
-    (re.compile(r"(\d{4})(\d{2})(\d{2})"), False),
+    # YYYYMMDD only (no time) – last to avoid matching random 8-digit numbers
+    (re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)"), False),
 ]
 
 _exiftool_available: Optional[bool] = None
@@ -52,46 +83,21 @@ def check_exiftool() -> bool:
     return _exiftool_available
 
 
-def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
-    """Extract timestamp from Google Takeout JSON sidecar.
+# ---------------------------------------------------------------------------
+# Timestamp extraction from various sources
+# ---------------------------------------------------------------------------
 
-    Returns (datetime, source_label) or None.
-    Priority: photoTakenTime > creationTime.
-    """
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("Failed to read JSON %s: %s", json_path, e)
-        return None
-
-    # Priority 1: photoTakenTime
-    pt = data.get("photoTakenTime", {})
-    ts = pt.get("timestamp")
-    if ts:
-        try:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            if dt.year > 1970:  # Sanity check – epoch 0 means missing
-                return dt, "json_photoTakenTime"
-        except (ValueError, OSError):
-            pass
-
-    # Priority 2: creationTime
-    ct = data.get("creationTime", {})
-    ts = ct.get("timestamp")
-    if ts:
-        try:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            if dt.year > 1970:
-                return dt, "json_creationTime"
-        except (ValueError, OSError):
-            pass
-
-    return None
+def _is_valid_timestamp(dt: datetime) -> bool:
+    """Reject timestamps that are clearly wrong (epoch 0, future)."""
+    return dt.year > 1970 and dt.year < 2100
 
 
 def get_timestamp_from_filename(filepath: Path) -> Optional[Tuple[datetime, str]]:
-    """Try to parse a date/time from the filename."""
+    """Priority 1: Parse a date/time from the filename.
+
+    The filename is the most trustworthy source because it's written
+    by the device at capture time, before any cloud sync.
+    """
     name = filepath.stem
 
     for pattern, has_time in FILENAME_DATE_PATTERNS:
@@ -110,7 +116,7 @@ def get_timestamp_from_filename(filepath: Path) -> Optional[Tuple[datetime, str]
                         int(groups[0]), int(groups[1]), int(groups[2]),
                         tzinfo=timezone.utc,
                     )
-                if 1900 < dt.year < 2100:
+                if _is_valid_timestamp(dt):
                     return dt, "filename"
             except ValueError:
                 continue
@@ -118,29 +124,127 @@ def get_timestamp_from_filename(filepath: Path) -> Optional[Tuple[datetime, str]
     return None
 
 
+def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
+    """Priority 2: Extract timestamp from Google Takeout JSON sidecar.
+
+    Returns (datetime, source_label) or None.
+    Order: photoTakenTime > creationTime.
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read JSON %s: %s", json_path, e)
+        return None
+
+    for field, label in [
+        ("photoTakenTime", "json_photoTakenTime"),
+        ("creationTime", "json_creationTime"),
+    ]:
+        ts = data.get(field, {}).get("timestamp")
+        if ts:
+            try:
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                if _is_valid_timestamp(dt):
+                    return dt, label
+            except (ValueError, OSError, OverflowError):
+                pass
+
+    return None
+
+
+def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
+    """Priority 3: Read existing EXIF DateTimeOriginal from the file."""
+    ext = filepath.suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".tiff", ".tif"):
+        return None
+
+    try:
+        exif_dict = piexif.load(str(filepath))
+        raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+        if raw:
+            date_str = raw.decode("utf-8", errors="ignore").strip()
+            if date_str and date_str != "0000:00:00 00:00:00":
+                dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+                if _is_valid_timestamp(dt):
+                    return dt, "exif_original"
+    except Exception:
+        pass
+
+    return None
+
+
 def get_timestamp_from_mtime(filepath: Path) -> Tuple[datetime, str]:
-    """Fallback: use file modification time."""
+    """Priority 4 (fallback): use file modification time."""
     mtime = os.path.getmtime(filepath)
     dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
     return dt, "file_mtime"
 
 
-def resolve_timestamp(media_path: Path, json_path: Optional[Path]) -> Tuple[datetime, str]:
+# ---------------------------------------------------------------------------
+# Main resolver with cross-validation
+# ---------------------------------------------------------------------------
+
+def resolve_timestamp(
+    media_path: Path,
+    json_path: Optional[Path],
+) -> Tuple[datetime, str, Optional[str]]:
     """Resolve the best timestamp for a media file.
 
-    Priority: JSON photoTakenTime > JSON creationTime > filename parse > file mtime.
+    NEW PRIORITY:
+      1. Filename (highest trust – set by device at capture time)
+      2. Google JSON photoTakenTime / creationTime
+      3. Existing EXIF DateTimeOriginal
+      4. File modification time (flagged)
+
+    Returns (datetime, source_label, mismatch_info_or_None).
+    mismatch_info is set when filename and JSON dates differ by >30 days.
     """
-    if json_path:
-        result = get_timestamp_from_json(json_path)
-        if result:
-            return result
+    filename_result = get_timestamp_from_filename(media_path)
+    json_result = get_timestamp_from_json(json_path) if json_path else None
+    mismatch_info = None
 
-    result = get_timestamp_from_filename(media_path)
-    if result:
-        return result
+    # Cross-validation: check if filename and JSON dates diverge
+    if filename_result and json_result:
+        fn_dt = filename_result[0]
+        js_dt = json_result[0]
+        delta = abs((fn_dt - js_dt).days)
+        if delta > MISMATCH_THRESHOLD_DAYS:
+            mismatch_info = (
+                f"date_mismatch: filename={fn_dt.strftime('%Y-%m-%d')} "
+                f"json={js_dt.strftime('%Y-%m-%d')} delta={delta}d"
+            )
+            logger.info(
+                "Date mismatch for %s: filename=%s json=%s (delta=%dd, using filename)",
+                media_path.name,
+                fn_dt.strftime("%Y-%m-%d"),
+                js_dt.strftime("%Y-%m-%d"),
+                delta,
+            )
 
-    return get_timestamp_from_mtime(media_path)
+    # Priority 1: Filename
+    if filename_result:
+        return filename_result[0], filename_result[1], mismatch_info
 
+    # Priority 2: JSON
+    if json_result:
+        return json_result[0], json_result[1], mismatch_info
+
+    # Priority 3: Existing EXIF
+    exif_result = get_timestamp_from_exif(media_path)
+    if exif_result:
+        return exif_result[0], exif_result[1], mismatch_info
+
+    # Priority 4: File mtime (flagged)
+    mtime_dt, mtime_source = get_timestamp_from_mtime(media_path)
+    return mtime_dt, mtime_source, mismatch_info
+
+
+# ---------------------------------------------------------------------------
+# EXIF writing
+# ---------------------------------------------------------------------------
 
 def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
     """Write EXIF dates to JPEG/PNG/WEBP/TIFF using piexif."""
@@ -225,10 +329,14 @@ def set_file_timestamps(filepath: Path, dt: datetime) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Main per-file processing
+# ---------------------------------------------------------------------------
+
 def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
     """Process a single media file: resolve timestamp, write EXIF, set file times.
 
-    Returns a dict with processing results.
+    Returns a dict with processing results including cross-validation info.
     """
     result = {
         "original_path": str(media_path),
@@ -236,13 +344,19 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         "timestamp_source": None,
         "exif_written": False,
         "exiftool_used": False,
+        "date_mismatch": None,
         "status": "ok",
     }
 
     try:
-        dt, source = resolve_timestamp(media_path, json_path)
+        dt, source, mismatch = resolve_timestamp(media_path, json_path)
         result["timestamp_used"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         result["timestamp_source"] = source
+        result["date_mismatch"] = mismatch
+
+        # Flag file_mtime as low-confidence
+        if source == "file_mtime":
+            result["status"] = "flag_mtime_only"
 
         ext = media_path.suffix.lower()
 

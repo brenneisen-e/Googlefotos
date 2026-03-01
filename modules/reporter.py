@@ -16,7 +16,7 @@ def write_repair_log(
     """Write repair_log.csv with per-file processing results.
 
     Columns: original_path, new_filename, timestamp_used, timestamp_source,
-             exif_written, exiftool_used, status
+             exif_written, exiftool_used, date_mismatch, status
     """
     csv_path = Path(output_dir) / "repair_log.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,12 +37,14 @@ def write_repair_log(
             "timestamp_source": pr.get("timestamp_source", ""),
             "exif_written": str(pr.get("exif_written", False)),
             "exiftool_used": str(pr.get("exiftool_used", False)),
+            "date_mismatch": pr.get("date_mismatch", ""),
             "status": pr.get("status", rr.get("status", "")),
         })
 
     fieldnames = [
         "original_path", "new_filename", "timestamp_used",
-        "timestamp_source", "exif_written", "exiftool_used", "status",
+        "timestamp_source", "exif_written", "exiftool_used",
+        "date_mismatch", "status",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -94,6 +96,9 @@ def write_summary(
     no_timestamp: int,
     exiftool_available: bool,
     processing_time: float,
+    date_mismatches: int = 0,
+    flagged_mtime: int = 0,
+    source_counts: dict = None,
 ) -> str:
     """Write summary.txt with overall statistics."""
     summary_path = Path(output_dir) / "summary.txt"
@@ -113,12 +118,30 @@ def write_summary(
         f"  Visual duplicates deleted:     {visual_dupes:>8}",
         f"  Files with no JSON sidecar:    {no_json:>8}",
         f"  Files with no timestamp found: {no_timestamp:>8}",
+        f"  Date mismatches (fn vs json):  {date_mismatches:>8}",
+        f"  Flagged (mtime only):          {flagged_mtime:>8}",
         f"  ExifTool available:            {'yes':>8}" if exiftool_available else f"  ExifTool available:            {'no':>8}",
         "",
+    ]
+
+    # Timestamp source breakdown
+    if source_counts:
+        lines.append("  Timestamp sources:")
+        for src in sorted(source_counts, key=source_counts.get, reverse=True):
+            lines.append(f"    {src:<30s} {source_counts[src]:>8}")
+        lines.append("")
+
+    lines.extend([
         f"  Processing time:               {duration:>8}",
         "",
+        "  Timestamp priority order:",
+        "    1. Filename (highest trust)",
+        "    2. Google JSON (photoTakenTime / creationTime)",
+        "    3. Existing EXIF DateTimeOriginal",
+        "    4. File modification time (flagged)",
+        "",
         "=" * 60,
-    ]
+    ])
 
     text = "\n".join(lines) + "\n"
 

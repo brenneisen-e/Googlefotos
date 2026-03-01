@@ -410,6 +410,9 @@ def main():
     timestamps_set_count = 0
     no_timestamp_count = 0
     skipped_resume_count = 0
+    date_mismatch_count = 0
+    flagged_mtime_count = 0
+    source_counts = {}
 
     with Progress(
         SpinnerColumn(),
@@ -435,6 +438,7 @@ def main():
                         "timestamp_source": "resumed",
                         "exif_written": False,
                         "exiftool_used": False,
+                        "date_mismatch": None,
                         "status": "skipped_resume",
                     })
                     skipped_resume_count += 1
@@ -454,6 +458,15 @@ def main():
                     else:
                         no_timestamp_count += 1
 
+                    if result.get("date_mismatch"):
+                        date_mismatch_count += 1
+
+                    src = result.get("timestamp_source", "unknown")
+                    source_counts[src] = source_counts.get(src, 0) + 1
+
+                    if result.get("status") == "flag_mtime_only":
+                        flagged_mtime_count += 1
+
                     # Track in resume DB
                     if resume_conn:
                         mark_processed(resume_conn, file_key, "metadata")
@@ -466,6 +479,7 @@ def main():
                         "timestamp_source": None,
                         "exif_written": False,
                         "exiftool_used": False,
+                        "date_mismatch": None,
                         "status": f"error: {e}",
                     })
 
@@ -483,7 +497,21 @@ def main():
     }
     if skipped_resume_count:
         phase3_stats["skipped_resume"] = skipped_resume_count
+    if date_mismatch_count:
+        phase3_stats["date_mismatches"] = date_mismatch_count
+    if flagged_mtime_count:
+        phase3_stats["flagged_mtime_only"] = flagged_mtime_count
     print_phase_stats(phase3_stats)
+
+    # Show timestamp source breakdown
+    if source_counts:
+        src_table = Table(title="Timestamp Sources", show_header=False, border_style="dim")
+        src_table.add_column("Source", style="bold")
+        src_table.add_column("Count", justify="right")
+        for src in sorted(source_counts, key=source_counts.get, reverse=True):
+            src_table.add_row(src, str(source_counts[src]))
+        console.print(src_table)
+        console.print()
 
     # ------------------------------------------------------------------
     # Phase 4: Rename & Copy to Output
@@ -597,6 +625,9 @@ def main():
         no_timestamp=no_timestamp_count,
         exiftool_available=exiftool_ok,
         processing_time=processing_time,
+        date_mismatches=date_mismatch_count,
+        flagged_mtime=flagged_mtime_count,
+        source_counts=source_counts,
     )
 
     console.print(f"  Repair log:        {repair_log_path}")
@@ -617,6 +648,10 @@ def main():
     final_table.add_row("Exact duplicates deleted", str(exact_dupes))
     final_table.add_row("Visual duplicates deleted", str(visual_dupes))
     final_table.add_row("Files with no JSON", str(unmatched_count))
+    if date_mismatch_count:
+        final_table.add_row("[yellow]Date mismatches (fn vs json)[/yellow]", f"[yellow]{date_mismatch_count}[/yellow]")
+    if flagged_mtime_count:
+        final_table.add_row("[yellow]Flagged (mtime only)[/yellow]", f"[yellow]{flagged_mtime_count}[/yellow]")
     final_table.add_row("Processing time", f"{processing_time:.1f}s")
 
     if args.dry_run:
