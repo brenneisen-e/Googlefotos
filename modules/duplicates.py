@@ -3,6 +3,7 @@
 Uses MD5 for exact duplicates and pHash (via imagehash) for visual duplicates.
 Stores file metadata in a SQLite database for efficient querying.
 Uses a BK-tree for sublinear pHash comparison.
+MD5 and pHash computation is parallelized via multiprocessing.Pool.
 """
 
 import hashlib
@@ -26,7 +27,7 @@ BATCH_SIZE = 1000
 
 
 # ---------------------------------------------------------------------------
-# BK-tree for efficient pHash comparison
+# BK-tree for efficient pHash comparison (sublinear lookup)
 # ---------------------------------------------------------------------------
 
 class BKTreeNode:
@@ -39,7 +40,11 @@ class BKTreeNode:
 
 
 class BKTree:
-    """BK-tree for Hamming distance queries on integer hashes."""
+    """BK-tree for Hamming distance queries on 64-bit perceptual hashes.
+
+    Provides O(n^alpha) lookup with alpha < 1 instead of O(n) brute force,
+    critical for 100k+ image collections.
+    """
 
     def __init__(self):
         self.root: Optional[BKTreeNode] = None
@@ -59,15 +64,6 @@ class BKTree:
         current = self.root
         while True:
             d = self._hamming(current.hash_val, hash_val)
-            if d == 0 and current.filepath != filepath:
-                # Exact hash match but different file – still insert
-                # Use a small offset to differentiate
-                d = 1
-                while d in current.children:
-                    d += 1
-                current.children[d] = node
-                self.size += 1
-                return
             if d in current.children:
                 current = current.children[d]
             else:
@@ -90,11 +86,18 @@ class BKTree:
             d = self._hamming(node.hash_val, hash_val)
             if d <= threshold:
                 results.append((node.filepath, d))
-            # BK-tree pruning: only explore children with keys in [d-threshold, d+threshold]
+            # BK-tree pruning: only explore children in [d-threshold, d+threshold]
+            lo = d - threshold
+            hi = d + threshold
             for key, child in node.children.items():
-                if d - threshold <= key <= d + threshold:
+                if lo <= key <= hi:
                     stack.append(child)
         return results
+
+    def bulk_insert(self, items: List[Tuple[int, str]]) -> None:
+        """Insert many (hash_val, filepath) pairs at once."""
+        for h, fp in items:
+            self.insert(h, fp)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +122,16 @@ def init_db(db_path: str) -> sqlite3.Connection:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_md5 ON files(md5)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON files(phash)")
+
+    # Resume tracking table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed (
+            filepath TEXT PRIMARY KEY,
+            phase TEXT,
+            completed_at TEXT
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -140,6 +153,14 @@ def store_file_info(conn: sqlite3.Connection, info: dict) -> None:
     )
 
 
+def is_already_hashed(conn: sqlite3.Connection, filepath: str) -> bool:
+    """Check if a file has already been hashed in the database."""
+    cursor = conn.execute(
+        "SELECT 1 FROM files WHERE filepath = ? AND md5 IS NOT NULL", (filepath,)
+    )
+    return cursor.fetchone() is not None
+
+
 # ---------------------------------------------------------------------------
 # Hash computation (designed for multiprocessing)
 # ---------------------------------------------------------------------------
@@ -148,13 +169,16 @@ def _compute_md5(filepath: str) -> str:
     """Compute MD5 hash of a file."""
     h = hashlib.md5()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
 def _compute_file_info(filepath: str) -> dict:
-    """Compute MD5, pHash (for images), dimensions, and size."""
+    """Compute MD5, pHash (for images), dimensions, and size.
+
+    This function is designed to be called from a multiprocessing pool.
+    """
     info = {
         "filepath": filepath,
         "md5": None,
@@ -173,7 +197,7 @@ def _compute_file_info(filepath: str) -> dict:
         mtime = os.path.getmtime(filepath)
         info["timestamp"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
-        # Compute pHash for images
+        # Compute pHash for images only
         ext = Path(filepath).suffix.lower()
         if ext in ALL_IMAGE_EXTENSIONS:
             try:
@@ -189,6 +213,56 @@ def _compute_file_info(filepath: str) -> dict:
         logger.warning("Error computing info for %s: %s", filepath, e)
 
     return info
+
+
+def compute_hashes_parallel(
+    filepaths: list,
+    conn: sqlite3.Connection,
+    skip_existing: bool = False,
+) -> list:
+    """Compute MD5/pHash for a list of files using multiprocessing.
+
+    Args:
+        filepaths: list of file path strings
+        conn: SQLite connection for storing results
+        skip_existing: if True, skip files already in the database
+
+    Returns:
+        list of file info dicts
+    """
+    if skip_existing:
+        to_process = [fp for fp in filepaths if not is_already_hashed(conn, fp)]
+        logger.info(
+            "Hashing: %d new files (%d already in DB, skipped)",
+            len(to_process), len(filepaths) - len(to_process),
+        )
+    else:
+        to_process = filepaths
+
+    if not to_process:
+        return []
+
+    num_workers = max(1, cpu_count() - 1)
+    all_results = []
+
+    for i in range(0, len(to_process), BATCH_SIZE):
+        batch = to_process[i : i + BATCH_SIZE]
+        try:
+            with Pool(processes=num_workers) as pool:
+                batch_results = pool.map(_compute_file_info, batch)
+            all_results.extend(batch_results)
+        except Exception as e:
+            logger.warning("Multiprocessing failed, falling back to sequential: %s", e)
+            for fp in batch:
+                all_results.append(_compute_file_info(fp))
+
+        # Store batch in DB incrementally
+        for info in all_results[len(all_results) - len(batch):]:
+            if info["md5"]:
+                store_file_info(conn, info)
+        conn.commit()
+
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +323,7 @@ def find_visual_duplicates(
 ) -> list:
     """Step 2: Find and delete visual duplicates (similar pHash).
 
-    Uses BK-tree for efficient comparison.
+    Uses BK-tree for efficient sublinear comparison.
     Keeps the file with the earliest timestamp in each group.
     Returns list of deletion records.
     """
@@ -262,44 +336,63 @@ def find_visual_duplicates(
     if len(rows) < 2:
         return []
 
+    logger.info("Building BK-tree with %d image hashes...", len(rows))
+
     # Build BK-tree
     tree = BKTree()
     file_info = {}
+    items = []
     for filepath, phash, timestamp in rows:
-        tree.insert(phash, filepath)
+        items.append((phash, filepath))
         file_info[filepath] = {"phash": phash, "timestamp": timestamp or ""}
+    tree.bulk_insert(items)
 
-    # Find groups of visual duplicates using Union-Find
+    logger.info("BK-tree built (%d nodes). Querying for visual duplicates...", tree.size)
+
+    # Find groups of visual duplicates using Union-Find with path compression
     parent = {}
+    rank = {}
 
     def find(x):
-        while parent.get(x, x) != x:
-            parent[x] = parent.get(parent[x], parent[x])
-            x = parent[x]
-        return x
+        if x not in parent:
+            parent[x] = x
+            rank[x] = 0
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        # Path compression
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
 
     def union(a, b):
         ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+        if ra == rb:
+            return
+        # Union by rank
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
 
-    processed = set()
+    already_queried = set()
     for filepath, phash, timestamp in rows:
+        if filepath in already_queried:
+            continue
         matches = tree.query(phash, threshold)
         for match_path, dist in matches:
-            if match_path != filepath and match_path not in processed:
+            if match_path != filepath:
                 union(filepath, match_path)
-        processed.add(filepath)
+        already_queried.add(filepath)
 
     # Group by root
     groups = defaultdict(list)
     for filepath in file_info:
-        if find(filepath) != filepath or any(
-            find(f) == find(filepath) for f in file_info if f != filepath and find(f) == find(filepath)
-        ):
-            groups[find(filepath)].append(filepath)
+        root = find(filepath)
+        groups[root].append(filepath)
 
-    # Filter to groups with 2+ members
+    # Process groups with 2+ members
     deletions = []
     already_deleted = set()
 
@@ -307,7 +400,7 @@ def find_visual_duplicates(
         if len(members) < 2:
             continue
 
-        # Sort by timestamp (earliest first)
+        # Sort by timestamp (earliest first), then by path
         members.sort(key=lambda fp: (file_info[fp]["timestamp"], fp))
         keeper = members[0]
 
@@ -315,7 +408,6 @@ def find_visual_duplicates(
             if fp in already_deleted:
                 continue
 
-            # Compute actual distance for the record
             dist = BKTree._hamming(file_info[keeper]["phash"], file_info[fp]["phash"])
             similarity = 1.0 - (dist / 64.0)
 
@@ -349,8 +441,16 @@ def run_duplicate_detection(
     db_path: str = "photos.db",
     phash_threshold: int = 8,
     dry_run: bool = False,
+    resume: bool = False,
 ) -> dict:
     """Run full duplicate detection pipeline.
+
+    Args:
+        output_dir: directory containing output files
+        db_path: SQLite database path
+        phash_threshold: Hamming distance threshold for visual duplicates
+        dry_run: if True, don't delete anything
+        resume: if True, skip files already hashed in the database
 
     Returns dict with stats and deletion records.
     """
@@ -363,29 +463,11 @@ def run_duplicate_detection(
         if f.is_file() and f.suffix.lower() in (ALL_IMAGE_EXTENSIONS | VIDEO_EXTENSIONS)
     ]
 
-    logger.info("Computing hashes for %d files...", len(all_files))
+    logger.info("Computing hashes for %d files (workers: %d)...",
+                len(all_files), max(1, cpu_count() - 1))
 
-    # Compute file info using multiprocessing
-    num_workers = max(1, cpu_count() - 1)
-    results = []
-
-    # Process in batches to avoid memory issues
-    for i in range(0, len(all_files), BATCH_SIZE):
-        batch = all_files[i : i + BATCH_SIZE]
-        try:
-            with Pool(processes=num_workers) as pool:
-                batch_results = pool.map(_compute_file_info, batch)
-            results.extend(batch_results)
-        except Exception as e:
-            logger.warning("Multiprocessing failed, falling back to sequential: %s", e)
-            for fp in batch:
-                results.append(_compute_file_info(fp))
-
-    # Store in database
-    for info in results:
-        if info["md5"]:  # Only store if we could compute the hash
-            store_file_info(conn, info)
-    conn.commit()
+    # Compute hashes with multiprocessing (optionally skip already-hashed)
+    compute_hashes_parallel(all_files, conn, skip_existing=resume)
 
     # Step 1: Exact duplicates (MD5)
     logger.info("Finding exact duplicates (MD5)...")

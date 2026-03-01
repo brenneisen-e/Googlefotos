@@ -14,6 +14,7 @@ import shutil
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -31,7 +32,7 @@ from modules.metadata import (
     VIDEO_EXTENSIONS,
 )
 from modules.renamer import rename_all
-from modules.duplicates import run_duplicate_detection
+from modules.duplicates import run_duplicate_detection, init_db
 from modules.reporter import write_repair_log, write_duplicates_report, write_summary
 
 console = Console()
@@ -81,6 +82,10 @@ def parse_args():
         "--sample", type=int, default=None, metavar="N",
         help="Randomly sample N files for a test run (e.g. --sample 500)",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume a previous run, skipping already-processed files",
+    )
     return parser.parse_args()
 
 
@@ -94,6 +99,32 @@ def scan_media_files(temp_dir: str) -> list:
             media_files.append(f)
 
     return sorted(media_files)
+
+
+# ---------------------------------------------------------------------------
+# Resume tracking via SQLite
+# ---------------------------------------------------------------------------
+
+def init_resume_db(db_path: str) -> sqlite3.Connection:
+    """Open/create the resume tracking database."""
+    conn = init_db(db_path)  # reuses the duplicates schema + adds processed table
+    return conn
+
+
+def get_processed_files(conn: sqlite3.Connection, phase: str) -> set:
+    """Get set of filepaths already processed for a given phase."""
+    cursor = conn.execute(
+        "SELECT filepath FROM processed WHERE phase = ?", (phase,)
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
+def mark_processed(conn: sqlite3.Connection, filepath: str, phase: str) -> None:
+    """Mark a file as processed for a given phase."""
+    conn.execute(
+        "INSERT OR REPLACE INTO processed (filepath, phase, completed_at) VALUES (?, ?, ?)",
+        (filepath, phase, datetime.now(timezone.utc).isoformat()),
+    )
 
 
 def create_sample(
@@ -221,6 +252,8 @@ def print_config(args, exiftool_ok: bool):
     table.add_row("ExifTool available", "Yes" if exiftool_ok else "No")
     if args.sample:
         table.add_row("Sample mode", f"{args.sample} files (seed=42)")
+    if args.resume:
+        table.add_row("Resume mode", "ON (skip already-processed)")
     console.print(table)
     console.print()
 
@@ -359,11 +392,24 @@ def main():
     phase_num += 1
     print_phase("Metadata Repair (EXIF + Timestamps)", phase_num, total_phases)
 
+    # Resume tracking
+    db_name = "photos_sample.db" if is_sample else "photos.db"
+    resume_conn = init_resume_db(db_name) if args.resume else None
+    already_metadata = get_processed_files(resume_conn, "metadata") if resume_conn else set()
+    already_renamed = get_processed_files(resume_conn, "rename") if resume_conn else set()
+
+    if args.resume and already_metadata:
+        console.print(
+            f"[dim]Resume: {len(already_metadata)} files already processed "
+            f"(metadata), {len(already_renamed)} already renamed[/dim]\n"
+        )
+
     process_results = []
     exif_written_count = 0
     exiftool_used_count = 0
     timestamps_set_count = 0
     no_timestamp_count = 0
+    skipped_resume_count = 0
 
     with Progress(
         SpinnerColumn(),
@@ -379,6 +425,22 @@ def main():
             batch = matched_files[i : i + BATCH_SIZE]
 
             for media_path, json_path in batch:
+                file_key = str(media_path)
+
+                # Skip if already processed in a previous run
+                if file_key in already_metadata:
+                    process_results.append({
+                        "original_path": file_key,
+                        "timestamp_used": None,
+                        "timestamp_source": "resumed",
+                        "exif_written": False,
+                        "exiftool_used": False,
+                        "status": "skipped_resume",
+                    })
+                    skipped_resume_count += 1
+                    progress.advance(task)
+                    continue
+
                 try:
                     result = process_file(media_path, json_path)
                     process_results.append(result)
@@ -392,10 +454,14 @@ def main():
                     else:
                         no_timestamp_count += 1
 
+                    # Track in resume DB
+                    if resume_conn:
+                        mark_processed(resume_conn, file_key, "metadata")
+
                 except Exception as e:
                     logger.error("Unhandled error processing %s: %s", media_path, e)
                     process_results.append({
-                        "original_path": str(media_path),
+                        "original_path": file_key,
                         "timestamp_used": None,
                         "timestamp_source": None,
                         "exif_written": False,
@@ -405,12 +471,19 @@ def main():
 
                 progress.advance(task)
 
-    print_phase_stats({
+            # Commit resume progress per batch
+            if resume_conn:
+                resume_conn.commit()
+
+    phase3_stats = {
         "exif_written": exif_written_count,
         "exiftool_used": exiftool_used_count,
         "timestamps_set": timestamps_set_count,
         "no_timestamp": no_timestamp_count,
-    })
+    }
+    if skipped_resume_count:
+        phase3_stats["skipped_resume"] = skipped_resume_count
+    print_phase_stats(phase3_stats)
 
     # ------------------------------------------------------------------
     # Phase 4: Rename & Copy to Output
@@ -418,15 +491,53 @@ def main():
     phase_num += 1
     print_phase("Rename & Copy to Output", phase_num, total_phases)
 
-    rename_results = rename_all(matched_files, process_results, effective_temp, effective_output)
+    # Filter out already-renamed files if resuming
+    if args.resume and already_renamed:
+        files_to_rename = []
+        results_to_rename = []
+        rename_results_skipped = []
+        for (mp, jp), pr in zip(matched_files, process_results):
+            if str(mp) in already_renamed:
+                rename_results_skipped.append({
+                    "original_path": str(mp),
+                    "new_path": None,
+                    "new_filename": None,
+                    "status": "skipped_resume",
+                })
+            else:
+                files_to_rename.append((mp, jp))
+                results_to_rename.append(pr)
+
+        new_rename_results = rename_all(
+            files_to_rename, results_to_rename, effective_temp, effective_output
+        )
+
+        # Mark newly renamed files
+        if resume_conn:
+            for rr in new_rename_results:
+                if rr["status"] == "ok":
+                    mark_processed(resume_conn, rr["original_path"], "rename")
+            resume_conn.commit()
+
+        rename_results = rename_results_skipped + new_rename_results
+    else:
+        rename_results = rename_all(
+            matched_files, process_results, effective_temp, effective_output
+        )
+        if resume_conn:
+            for rr in rename_results:
+                if rr["status"] == "ok":
+                    mark_processed(resume_conn, rr["original_path"], "rename")
+            resume_conn.commit()
 
     copy_ok = sum(1 for r in rename_results if r["status"] == "ok")
-    copy_fail = len(rename_results) - copy_ok
+    copy_skip = sum(1 for r in rename_results if r["status"] == "skipped_resume")
+    copy_fail = len(rename_results) - copy_ok - copy_skip
 
-    print_phase_stats({
-        "files_copied": copy_ok,
-        "copy_failures": copy_fail,
-    })
+    phase4_stats = {"files_copied": copy_ok, "copy_failures": copy_fail}
+    if copy_skip:
+        phase4_stats["skipped_resume"] = copy_skip
+    print_phase_stats(phase4_stats)
 
     # ------------------------------------------------------------------
     # Phase 5: Duplicate Detection
@@ -440,12 +551,13 @@ def main():
         phase_num += 1
         print_phase("Duplicate Detection", phase_num, total_phases)
 
-        db_name = "photos_sample.db" if is_sample else "photos.db"
+        dup_db = "photos_sample.db" if is_sample else "photos.db"
         dup_results = run_duplicate_detection(
             output_dir=effective_output,
-            db_path=db_name,
+            db_path=dup_db,
             phash_threshold=args.phash_threshold,
             dry_run=args.dry_run,
+            resume=args.resume,
         )
 
         exact_dupes = dup_results["exact_duplicates_deleted"]
@@ -460,6 +572,10 @@ def main():
         })
     else:
         console.print("[dim]Skipping duplicate detection (--skip-duplicates)[/dim]\n")
+
+    # Close resume DB
+    if resume_conn:
+        resume_conn.close()
 
     # ------------------------------------------------------------------
     # Generate Reports

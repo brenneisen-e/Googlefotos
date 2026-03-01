@@ -63,6 +63,16 @@ python repair.py --skip-duplicates
 
 # Adjust visual duplicate sensitivity (lower = stricter)
 python repair.py --phash-threshold 4
+
+# Sample mode – test with 500 random files first
+python repair.py --sample 500
+
+# Resume after crash – skip already-processed files
+python repair.py --resume
+
+# Combine flags
+python repair.py --sample 500 --dry-run
+python repair.py --resume --skip-extraction
 ```
 
 ### CLI arguments
@@ -76,6 +86,8 @@ python repair.py --phash-threshold 4
 | `--dry-run` | off | Simulate everything, generate reports, delete nothing |
 | `--skip-duplicates` | off | Skip the duplicate detection phase |
 | `--skip-extraction` | off | Skip ZIP extraction (if already done) |
+| `--sample N` | off | Randomly sample N files for a test run |
+| `--resume` | off | Resume a previous run, skip already-processed files |
 
 ## How it works
 
@@ -144,12 +156,55 @@ output/
 | `duplicates_report.csv` | Every duplicate deletion: kept file, deleted file, type, similarity |
 | `summary.txt` | Overall statistics: totals, timing, ExifTool status |
 
+## Sample mode
+
+Test with a subset of your real data before running the full pipeline:
+
+```bash
+python repair.py --sample 500
+```
+
+- Selects 500 files using **stratified sampling** (proportional across subfolders, seed=42)
+- Copies sampled files + JSON sidecars to `./temp_sample/`
+- Outputs to `./output_sample/` with separate reports
+- Leaves `./temp/` completely untouched
+
+## Resume after crash
+
+For large exports (100k+ files) where a crash midway is likely:
+
+```bash
+python repair.py --resume
+```
+
+- Tracks all processed files in `photos.db` (SQLite)
+- On restart, skips files that were already processed (metadata + rename)
+- Also skips already-hashed files in duplicate detection
+- Safe to run repeatedly — picks up exactly where it left off
+
+## Test data generator
+
+Validate the tool before running on real data:
+
+```bash
+python test_generate.py              # 500 dummy files
+python test_generate.py --count 200  # custom count
+
+# Then test:
+python repair.py --skip-extraction --temp ./test_temp --output ./test_output
+```
+
+Generates JPEG files with intentional exact duplicates, visual duplicates, missing JSON sidecars, various filename patterns, and long filenames.
+
 ## Performance
 
 - Files are processed in batches of 1,000
-- MD5 and pHash computation uses multiprocessing (`os.cpu_count() - 1` workers)
-- pHash comparison uses a BK-tree index for sublinear lookup
-- SQLite with WAL mode for concurrent database writes
+- MD5 and pHash computation uses **multiprocessing** (`os.cpu_count() - 1` workers)
+- Read buffer: 64 KB chunks for fast MD5 hashing
+- pHash comparison uses a **BK-tree** index for sublinear O(n^alpha) lookup (not O(n²))
+- Union-Find with **path compression and union by rank** for duplicate grouping
+- SQLite with **WAL mode** for concurrent database writes
+- Incremental DB commits per batch (crash-safe)
 - Designed to handle 100,000+ files on a standard laptop
 
 ## Error handling
