@@ -289,97 +289,169 @@ def date_from_mtime(filepath: Path) -> datetime:
 # JSON sidecar matching (reused from modules/matcher.py logic)
 # ---------------------------------------------------------------------------
 
+# Cache for JSON maps per directory (avoids re-scanning the same folder)
+_json_map_cache: dict = {}
+
+
+def _get_json_map(directory: Path) -> dict:
+    """Build/return a case-insensitive map of all JSON files in directory."""
+    key = str(directory)
+    if key in _json_map_cache:
+        return _json_map_cache[key]
+    json_map = {}
+    try:
+        for f in directory.iterdir():
+            if f.is_file() and f.name.lower().endswith(".json"):
+                json_map[f.name.lower()] = f
+    except OSError:
+        pass
+    _json_map_cache[key] = json_map
+    return json_map
+
+
+# All known supplemental-metadata truncation variants that Google produces.
+# The full suffix is ".supplemental-metadata.json" but Google truncates it
+# progressively to keep total filename <= 51 chars.
+_SUPPL_SUFFIXES = [
+    ".supplemental-metadata.json",
+    ".supplemental-metadat.json",
+    ".supplemental-metada.json",
+    ".supplemental-metad.json",
+    ".supplemental-meta.json",
+    ".supplemental-met.json",
+    ".supplemental-me.json",
+    ".supplemental-m.json",
+    ".supplemental-.json",
+    ".supplemental.json",
+    ".supplementa.json",
+    ".supplement.json",
+    ".supplemen.json",
+    ".suppleme.json",
+    ".supplem.json",
+    ".supple.json",
+    ".suppl.json",
+    ".supp.json",
+    ".sup.json",
+]
+
+# Characters Google replaces with _ in exported filenames
+# (but the JSON title field keeps the originals)
+_SPECIAL_CHAR_MAP = str.maketrans("&?;'", "____")
+
+
 def _find_json(media_path: Path) -> Optional[Path]:
     """Find the Google Takeout JSON sidecar for a media file.
 
-    Google Takeout uses multiple naming schemes depending on export date:
-      Old:  photo.jpg.json
-      New:  photo.jpg.supplemental-metadata.json
-      Also: photo.json, truncated names, numbered duplicates, etc.
+    Covers all known Google Takeout naming schemes:
+      - Old format:  photo.jpg.json
+      - New format:  photo.jpg.supplemental-metadata.json (and truncated variants)
+      - Stem only:   photo.json
+      - Truncated filenames (46/47/51 char limits)
+      - Numbered duplicates with misplaced parenthesis
+      - -edited/-cropped fallback to original file's JSON
+      - Special character substitution (&?;' → _)
+      - Fuzzy match via JSON title field
     """
     parent = media_path.parent
     name = media_path.name
     stem = media_path.stem
     suffix = media_path.suffix
 
-    # Build case-insensitive lookup of ALL JSON files in the same directory.
-    # Use f.name ending with .json (not f.suffix) because supplemental-metadata
-    # files have suffix ".json" but also names like "photo.jpg.supplemental-metadata.json"
-    json_map = {}
-    try:
-        for f in parent.iterdir():
-            if f.is_file() and f.name.lower().endswith(".json"):
-                json_map[f.name.lower()] = f
-    except OSError:
+    json_map = _get_json_map(parent)
+    if not json_map:
         return None
 
     def lookup(candidate: str) -> Optional[Path]:
         return json_map.get(candidate.lower())
 
-    # --- Rule 1: supplemental-metadata (new Google Takeout format 2024+) ---
-    # photo.jpg.supplemental-metadata.json
-    r = lookup(name + ".supplemental-metadata.json")
+    # All JSON suffixes to try (new supplemental-metadata + old .json)
+    def _try_all_suffixes(base: str) -> Optional[Path]:
+        """Try a base string with all known JSON suffix variants."""
+        for s in _SUPPL_SUFFIXES:
+            r = lookup(base + s)
+            if r:
+                return r
+        r = lookup(base + ".json")
+        if r:
+            return r
+        return None
+
+    # --- Rule 1: Direct match (photo.jpg → photo.jpg.supplemental-metadata.json or photo.jpg.json) ---
+    r = _try_all_suffixes(name)
     if r:
         return r
 
-    # --- Rule 2: Classic format: photo.jpg.json ---
-    r = lookup(name + ".json")
-    if r:
-        return r
-
-    # --- Rule 3: Stem only: photo.json ---
+    # --- Rule 2: Stem only (photo.jpg → photo.json) ---
     r = lookup(stem + ".json")
     if r:
         return r
 
-    # --- Rule 4: Truncated filename at 46 or 47 chars ---
-    for trunc_len in (GOOGLE_TRUNCATE_LEN, 47, 51):
+    # --- Rule 3: Truncated filenames ---
+    # Google caps total filename at ~51 chars. The media filename itself can be
+    # truncated at ~47 chars (name part) or ~46 chars (before .json suffix).
+    for trunc_len in (46, 47, 51):
         if len(name) > trunc_len:
-            truncated = name[:trunc_len]
-            for json_suffix in (".supplemental-metadata.json", ".json"):
-                r = lookup(truncated + json_suffix)
-                if r:
-                    return r
-
-        if len(stem) > trunc_len:
-            truncated_stem = stem[:trunc_len]
-            for json_suffix in (".supplemental-metadata.json", ".json"):
-                r = lookup(truncated_stem + suffix + json_suffix)
-                if r:
-                    return r
-
-    # --- Rule 5: Numbered duplicates ---
-    # photo(1).jpg → photo.jpg(1).json  OR  photo(1).jpg.json
-    # Also: photo(1).jpg.supplemental-metadata.json
-    m = re.match(r"^(.+)\((\d+)\)$", stem)
-    if m:
-        base, num = m.group(1), m.group(2)
-        candidates = [
-            f"{base}{suffix}({num}).supplemental-metadata.json",
-            f"{base}{suffix}({num}).json",
-            f"{base}({num}).supplemental-metadata.json",
-            f"{base}({num}).json",
-        ]
-        for c in candidates:
-            r = lookup(c)
+            r = _try_all_suffixes(name[:trunc_len])
             if r:
                 return r
 
-    # --- Rule 6: Fuzzy match by title field inside JSON ---
-    # As last resort, check if any JSON in the folder has a "title" matching
-    # our media filename. This catches renamed/mangled files.
+        if len(stem) > trunc_len:
+            r = _try_all_suffixes(stem[:trunc_len] + suffix)
+            if r:
+                return r
+
+    # --- Rule 4: Numbered duplicates ---
+    # Google places the number differently:
+    #   Media:  photo(1).jpg
+    #   JSON:   photo.jpg(1).json  OR  photo.JPG(1).json  (case may differ!)
+    m = re.match(r"^(.+)\((\d+)\)$", stem)
+    if m:
+        base, num = m.group(1), m.group(2)
+        # Try with various extension cases
+        for ext_variant in (suffix, suffix.upper(), suffix.lower()):
+            r = _try_all_suffixes(f"{base}{ext_variant}({num})")
+            if r:
+                return r
+        # Also try: base(N).json directly
+        r = _try_all_suffixes(f"{base}({num})")
+        if r:
+            return r
+
+    # --- Rule 5: -edited / -cropped fallback ---
+    # These files have NO own JSON; fall back to the original's JSON.
+    for edit_suffix in ("-edited", "-cropped", "-edit", "-edi"):
+        if stem.lower().endswith(edit_suffix):
+            original_stem = stem[: -len(edit_suffix)]
+            original_name = original_stem + suffix
+            r = _try_all_suffixes(original_name)
+            if r:
+                return r
+            r = lookup(original_stem + ".json")
+            if r:
+                return r
+
+    # --- Rule 6: Fuzzy match via JSON title field ---
+    # Google may substitute &?;' with _ in filenames but keeps originals in
+    # the JSON title. Also handles other naming mismatches.
+    # Build reverse lookup: read JSON files and check if their "title" matches.
     name_lower = name.lower()
+    # Also create a version where special chars are normalized
+    name_normalized = name.lower().translate(_SPECIAL_CHAR_MAP)
+
     for json_name, json_file in json_map.items():
-        # Quick prefix check: JSON filename should start with part of media name
-        # to avoid reading every JSON file (expensive)
-        media_prefix = stem[:10].lower() if len(stem) >= 10 else stem.lower()
-        if not json_name.startswith(media_prefix):
-            continue
         try:
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            title = data.get("title", "").lower()
-            if title == name_lower:
+            title = data.get("title", "")
+            if not title:
+                continue
+            title_lower = title.lower()
+            title_normalized = title_lower.translate(_SPECIAL_CHAR_MAP)
+            # Match: exact, or after special-char normalization
+            if title_lower == name_lower or title_normalized == name_normalized:
+                return json_file
+            # Also match if title equals stem (without extension)
+            if title_lower == stem.lower():
                 return json_file
         except (json.JSONDecodeError, OSError):
             continue
@@ -615,7 +687,9 @@ def main():
     console.print(Panel("[bold]Phase 2: Medien-Dateien scannen[/bold]", border_style="green"))
     media_files = sorted(
         f for f in temp_dir.rglob("*")
-        if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS
+        if f.is_file()
+        and f.suffix.lower() in MEDIA_EXTENSIONS
+        and not f.name.startswith(".trashed-")
     )
     console.print(f"  {len(media_files)} Medien-Dateien gefunden\n")
 
@@ -644,6 +718,22 @@ def main():
             except Exception as e:
                 logger.error("Fehler bei %s: %s", mf.name, e)
             progress.advance(task)
+
+    # Deduplicate: same file can appear in album + year folder.
+    # Keep only one entry per filename (the one with the most metadata).
+    seen = {}
+    for row in mismatch_rows:
+        key = row["Datei"].lower()
+        if key not in seen:
+            seen[key] = row
+        else:
+            # Keep the one with more filled date fields
+            old = seen[key]
+            old_count = sum(1 for c in ("Datum Dateiname", "Datum JSON", "Datum EXIF", "Datum Video-Meta") if old.get(c))
+            new_count = sum(1 for c in ("Datum Dateiname", "Datum JSON", "Datum EXIF", "Datum Video-Meta") if row.get(c))
+            if new_count > old_count:
+                seen[key] = row
+    mismatch_rows = list(seen.values())
 
     # Sort by filename for readability
     mismatch_rows.sort(key=lambda r: r["Datei"])
