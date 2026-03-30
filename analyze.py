@@ -249,6 +249,38 @@ def date_from_exif(filepath: Path) -> Optional[datetime]:
     return None
 
 
+def date_from_video_metadata(filepath: Path) -> Optional[datetime]:
+    """Read creation date from video container metadata via ffprobe."""
+    ext = filepath.suffix.lower()
+    if ext not in VIDEO_EXTENSIONS:
+        return None
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_entries", "format_tags=creation_time",
+             str(filepath)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            import json as _json
+            data = _json.loads(result.stdout)
+            ct = data.get("format", {}).get("tags", {}).get("creation_time", "")
+            if ct:
+                # Typical format: "2025-06-10T01:11:31.000000Z"
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                            "%Y-%m-%d %H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(ct, fmt).replace(tzinfo=timezone.utc)
+                        if _valid(dt):
+                            return dt
+                    except ValueError:
+                        continue
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
 def date_from_mtime(filepath: Path) -> datetime:
     return datetime.fromtimestamp(os.path.getmtime(filepath), tz=timezone.utc)
 
@@ -258,17 +290,25 @@ def date_from_mtime(filepath: Path) -> datetime:
 # ---------------------------------------------------------------------------
 
 def _find_json(media_path: Path) -> Optional[Path]:
-    """Find the Google Takeout JSON sidecar for a media file."""
+    """Find the Google Takeout JSON sidecar for a media file.
+
+    Google Takeout uses multiple naming schemes depending on export date:
+      Old:  photo.jpg.json
+      New:  photo.jpg.supplemental-metadata.json
+      Also: photo.json, truncated names, numbered duplicates, etc.
+    """
     parent = media_path.parent
     name = media_path.name
     stem = media_path.stem
     suffix = media_path.suffix
 
-    # Build case-insensitive lookup
+    # Build case-insensitive lookup of ALL JSON files in the same directory.
+    # Use f.name ending with .json (not f.suffix) because supplemental-metadata
+    # files have suffix ".json" but also names like "photo.jpg.supplemental-metadata.json"
     json_map = {}
     try:
         for f in parent.iterdir():
-            if f.suffix.lower() == ".json" and f.is_file():
+            if f.is_file() and f.name.lower().endswith(".json"):
                 json_map[f.name.lower()] = f
     except OSError:
         return None
@@ -276,37 +316,73 @@ def _find_json(media_path: Path) -> Optional[Path]:
     def lookup(candidate: str) -> Optional[Path]:
         return json_map.get(candidate.lower())
 
-    # Rule 1: photo.jpg.json
+    # --- Rule 1: supplemental-metadata (new Google Takeout format 2024+) ---
+    # photo.jpg.supplemental-metadata.json
+    r = lookup(name + ".supplemental-metadata.json")
+    if r:
+        return r
+
+    # --- Rule 2: Classic format: photo.jpg.json ---
     r = lookup(name + ".json")
     if r:
         return r
 
-    # Rule 2: photo.json
+    # --- Rule 3: Stem only: photo.json ---
     r = lookup(stem + ".json")
     if r:
         return r
 
-    # Rule 3: truncated at 46 chars
-    if len(name) > GOOGLE_TRUNCATE_LEN:
-        r = lookup(name[:GOOGLE_TRUNCATE_LEN] + ".json")
-        if r:
-            return r
+    # --- Rule 4: Truncated filename at 46 or 47 chars ---
+    for trunc_len in (GOOGLE_TRUNCATE_LEN, 47, 51):
+        if len(name) > trunc_len:
+            truncated = name[:trunc_len]
+            for json_suffix in (".supplemental-metadata.json", ".json"):
+                r = lookup(truncated + json_suffix)
+                if r:
+                    return r
 
-    if len(stem) > GOOGLE_TRUNCATE_LEN:
-        r = lookup(stem[:GOOGLE_TRUNCATE_LEN] + suffix + ".json")
-        if r:
-            return r
+        if len(stem) > trunc_len:
+            truncated_stem = stem[:trunc_len]
+            for json_suffix in (".supplemental-metadata.json", ".json"):
+                r = lookup(truncated_stem + suffix + json_suffix)
+                if r:
+                    return r
 
-    # Rule 4: numbered duplicates photo(1).jpg → photo.jpg(1).json
+    # --- Rule 5: Numbered duplicates ---
+    # photo(1).jpg → photo.jpg(1).json  OR  photo(1).jpg.json
+    # Also: photo(1).jpg.supplemental-metadata.json
     m = re.match(r"^(.+)\((\d+)\)$", stem)
     if m:
         base, num = m.group(1), m.group(2)
-        r = lookup(f"{base}{suffix}({num}).json")
-        if r:
-            return r
-        r = lookup(f"{base}({num}).json")
-        if r:
-            return r
+        candidates = [
+            f"{base}{suffix}({num}).supplemental-metadata.json",
+            f"{base}{suffix}({num}).json",
+            f"{base}({num}).supplemental-metadata.json",
+            f"{base}({num}).json",
+        ]
+        for c in candidates:
+            r = lookup(c)
+            if r:
+                return r
+
+    # --- Rule 6: Fuzzy match by title field inside JSON ---
+    # As last resort, check if any JSON in the folder has a "title" matching
+    # our media filename. This catches renamed/mangled files.
+    name_lower = name.lower()
+    for json_name, json_file in json_map.items():
+        # Quick prefix check: JSON filename should start with part of media name
+        # to avoid reading every JSON file (expensive)
+        media_prefix = stem[:10].lower() if len(stem) >= 10 else stem.lower()
+        if not json_name.startswith(media_prefix):
+            continue
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            title = data.get("title", "").lower()
+            if title == name_lower:
+                return json_file
+        except (json.JSONDecodeError, OSError):
+            continue
 
     return None
 
@@ -324,6 +400,7 @@ def analyze_file(media_path: Path) -> Optional[dict]:
     fn_date = date_from_filename(media_path)
     json_date = date_from_json(json_path) if json_path else None
     exif_date = date_from_exif(media_path)
+    video_date = date_from_video_metadata(media_path)
     mtime_date = date_from_mtime(media_path)
 
     # Collect all available dates
@@ -334,6 +411,8 @@ def analyze_file(media_path: Path) -> Optional[dict]:
         sources["JSON"] = json_date
     if exif_date:
         sources["EXIF"] = exif_date
+    if video_date:
+        sources["Video-Meta"] = video_date
     sources["Änderungsdatum"] = mtime_date
 
     # Determine mismatches: compare all pairs of trustworthy sources
@@ -374,6 +453,7 @@ def analyze_file(media_path: Path) -> Optional[dict]:
         "Datum Dateiname": fn_date.strftime("%Y-%m-%d %H:%M:%S") if fn_date else "",
         "Datum JSON": json_date.strftime("%Y-%m-%d %H:%M:%S") if json_date else "",
         "Datum EXIF": exif_date.strftime("%Y-%m-%d %H:%M:%S") if exif_date else "",
+        "Datum Video-Meta": video_date.strftime("%Y-%m-%d %H:%M:%S") if video_date else "",
         "Änderungsdatum": mtime_date.strftime("%Y-%m-%d %H:%M:%S"),
         "Abweichung": "; ".join(mismatch_details),
         "JSON vorhanden": "Ja" if json_path else "Nein",
@@ -401,6 +481,7 @@ COLUMNS = [
     ("Datum Dateiname", 20),
     ("Datum JSON", 20),
     ("Datum EXIF", 20),
+    ("Datum Video-Meta", 20),
     ("Änderungsdatum", 20),
     ("Abweichung", 45),
     ("JSON vorhanden", 14),
