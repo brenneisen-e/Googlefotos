@@ -32,7 +32,16 @@ if errorlevel 1 (
 echo.
 echo [3/3] Analyse wird gestartet...
 echo.
-python analyze.py
+
+:: Pruefen ob bereits entpackt wurde
+if exist "temp_analyze\" (
+    echo Bereits entpackte Daten gefunden in temp_analyze\
+    echo Entpacken wird uebersprungen.
+    echo.
+    python analyze.py --skip-extraction
+) else (
+    python analyze.py
+)
 
 echo.
 echo ============================================
