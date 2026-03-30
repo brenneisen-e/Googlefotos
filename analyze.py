@@ -14,6 +14,7 @@ import os
 import re
 import struct
 import sys
+import urllib.parse
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -415,7 +416,25 @@ def _find_json_in_map(json_map: dict, media_name: str, media_stem: str,
                 if r:
                     return r
 
-    # --- Rule 7: Fuzzy match via JSON title field (same directory) ---
+    # --- Rule 7: URL-decoded fallback (100%25 atzen.jpg → 100% atzen.jpg) ---
+    decoded_name = urllib.parse.unquote(media_name)
+    if decoded_name != media_name:
+        decoded_stem = Path(decoded_name).stem
+        decoded_suffix = Path(decoded_name).suffix or media_suffix
+        r = prefix_match(decoded_name)
+        if r:
+            return r
+        r = lookup(decoded_stem + ".json")
+        if r:
+            return r
+    # Also try encoding the media name to find encoded JSON filenames
+    encoded_name = urllib.parse.quote(media_name, safe=" ")
+    if encoded_name != media_name:
+        r = prefix_match(encoded_name)
+        if r:
+            return r
+
+    # --- Rule 8: Fuzzy match via JSON title field (same directory) ---
     name_lower = media_name.lower()
     name_normalized = media_name.lower().translate(_SPECIAL_CHAR_MAP)
     stem_lower = media_stem.lower()
