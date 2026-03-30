@@ -189,24 +189,63 @@ def date_from_json(json_path: Path) -> Optional[datetime]:
 
 
 def date_from_exif(filepath: Path) -> Optional[datetime]:
-    if piexif is None:
-        return None
     ext = filepath.suffix.lower()
-    if ext not in (".jpg", ".jpeg", ".tiff", ".tif"):
+    if ext not in (".jpg", ".jpeg", ".tiff", ".tif", ".png", ".webp"):
         return None
-    try:
-        exif_dict = piexif.load(str(filepath))
-        raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
-        if raw:
-            s = raw.decode("utf-8", errors="ignore").strip()
-            if s and s != "0000:00:00 00:00:00":
-                dt = datetime.strptime(s, "%Y:%m:%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
+
+    def _parse_exif_date(s: str) -> Optional[datetime]:
+        """Parse common EXIF date string formats."""
+        s = s.strip().rstrip("\x00")
+        if not s or s == "0000:00:00 00:00:00":
+            return None
+        for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                     "%Y:%m:%d", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
                 if _valid(dt):
                     return dt
+            except ValueError:
+                continue
+        return None
+
+    # Method 1: piexif (fast, JPEG/TIFF only)
+    if piexif is not None and ext in (".jpg", ".jpeg", ".tiff", ".tif"):
+        try:
+            exif_dict = piexif.load(str(filepath))
+            for tag in (piexif.ExifIFD.DateTimeOriginal,
+                        piexif.ExifIFD.DateTimeDigitized):
+                raw = exif_dict.get("Exif", {}).get(tag)
+                if raw:
+                    dt = _parse_exif_date(raw.decode("utf-8", errors="ignore"))
+                    if dt:
+                        return dt
+            # Also check 0th IFD DateTime
+            raw = exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
+            if raw:
+                dt = _parse_exif_date(raw.decode("utf-8", errors="ignore"))
+                if dt:
+                    return dt
+        except Exception:
+            pass
+
+    # Method 2: Pillow fallback (works for more formats, more robust)
+    try:
+        from PIL import Image
+        from PIL.ExifTags import Base as ExifBase
+        with Image.open(filepath) as img:
+            exif_data = img.getexif()
+            if exif_data:
+                # Check DateTimeOriginal (tag 36867), DateTimeDigitized (36868),
+                # DateTime (306)
+                for tag_id in (36867, 36868, 306):
+                    val = exif_data.get(tag_id)
+                    if val and isinstance(val, str):
+                        dt = _parse_exif_date(val)
+                        if dt:
+                            return dt
     except Exception:
         pass
+
     return None
 
 
