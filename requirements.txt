@@ -3,3 +3,4 @@ piexif
 imagehash
 rich
 tqdm
+openpyxl
