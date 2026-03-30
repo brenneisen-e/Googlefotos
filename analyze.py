@@ -291,6 +291,9 @@ def date_from_mtime(filepath: Path) -> datetime:
 
 # Cache for JSON maps per directory (avoids re-scanning the same folder)
 _json_map_cache: dict = {}
+# Global title index: maps normalized title → json Path (built lazily)
+_title_index: dict = {}
+_title_index_built = False
 
 
 def _get_json_map(directory: Path) -> dict:
@@ -309,134 +312,113 @@ def _get_json_map(directory: Path) -> dict:
     return json_map
 
 
-# All known supplemental-metadata truncation variants that Google produces.
-# The full suffix is ".supplemental-metadata.json" but Google truncates it
-# progressively to keep total filename <= 51 chars.
-_SUPPL_SUFFIXES = [
-    ".supplemental-metadata.json",
-    ".supplemental-metadat.json",
-    ".supplemental-metada.json",
-    ".supplemental-metad.json",
-    ".supplemental-meta.json",
-    ".supplemental-met.json",
-    ".supplemental-me.json",
-    ".supplemental-m.json",
-    ".supplemental-.json",
-    ".supplemental.json",
-    ".supplementa.json",
-    ".supplement.json",
-    ".supplemen.json",
-    ".suppleme.json",
-    ".supplem.json",
-    ".supple.json",
-    ".suppl.json",
-    ".supp.json",
-    ".sup.json",
-]
-
 # Characters Google replaces with _ in exported filenames
 # (but the JSON title field keeps the originals)
 _SPECIAL_CHAR_MAP = str.maketrans("&?;'", "____")
 
+# Equivalent extensions (.jpg ↔ .jpeg)
+_EXT_EQUIVALENTS = {
+    ".jpg": [".jpeg"],
+    ".jpeg": [".jpg"],
+}
 
-def _find_json(media_path: Path) -> Optional[Path]:
-    """Find the Google Takeout JSON sidecar for a media file.
 
-    Covers all known Google Takeout naming schemes:
-      - Old format:  photo.jpg.json
-      - New format:  photo.jpg.supplemental-metadata.json (and truncated variants)
-      - Stem only:   photo.json
-      - Truncated filenames (46/47/51 char limits)
-      - Numbered duplicates with misplaced parenthesis
-      - -edited/-cropped fallback to original file's JSON
-      - Special character substitution (&?;' → _)
-      - Fuzzy match via JSON title field
+def _find_json_in_map(json_map: dict, media_name: str, media_stem: str,
+                       media_suffix: str) -> Optional[Path]:
+    """Core matching logic against a specific json_map.
+
+    Uses PREFIX-BASED matching: for a media file "photo.jpg", any JSON file
+    whose name starts with "photo.jpg." and ends with ".json" is a match.
+    This catches .json, .supplemental-metadata.json, and ALL truncation variants
+    without needing to enumerate them.
     """
-    parent = media_path.parent
-    name = media_path.name
-    stem = media_path.stem
-    suffix = media_path.suffix
-
-    json_map = _get_json_map(parent)
-    if not json_map:
-        return None
-
     def lookup(candidate: str) -> Optional[Path]:
         return json_map.get(candidate.lower())
 
-    # All JSON suffixes to try (new supplemental-metadata + old .json)
-    def _try_all_suffixes(base: str) -> Optional[Path]:
-        """Try a base string with all known JSON suffix variants."""
-        for s in _SUPPL_SUFFIXES:
-            r = lookup(base + s)
-            if r:
-                return r
-        r = lookup(base + ".json")
-        if r:
-            return r
+    def prefix_match(prefix: str) -> Optional[Path]:
+        """Find any JSON file starting with prefix and ending with .json."""
+        prefix_lower = prefix.lower() + "."
+        for json_name, json_file in json_map.items():
+            if json_name.startswith(prefix_lower) and json_name.endswith(".json"):
+                return json_file
         return None
 
-    # --- Rule 1: Direct match (photo.jpg → photo.jpg.supplemental-metadata.json or photo.jpg.json) ---
-    r = _try_all_suffixes(name)
+    # --- Rule 1: Prefix match (catches .json AND .supplemental-metadata.json AND all truncations) ---
+    # photo.jpg → matches photo.jpg.json, photo.jpg.supplemental-metadata.json,
+    #             photo.jpg.supplemental-me.json, photo.jpg.s.json, etc.
+    r = prefix_match(media_name)
     if r:
         return r
 
     # --- Rule 2: Stem only (photo.jpg → photo.json) ---
-    r = lookup(stem + ".json")
+    r = lookup(media_stem + ".json")
     if r:
         return r
 
-    # --- Rule 3: Truncated filenames ---
-    # Google caps total filename at ~51 chars. The media filename itself can be
-    # truncated at ~47 chars (name part) or ~46 chars (before .json suffix).
-    for trunc_len in (46, 47, 51):
-        if len(name) > trunc_len:
-            r = _try_all_suffixes(name[:trunc_len])
-            if r:
-                return r
-
-        if len(stem) > trunc_len:
-            r = _try_all_suffixes(stem[:trunc_len] + suffix)
-            if r:
-                return r
-
-    # --- Rule 4: Numbered duplicates ---
-    # Google places the number differently:
-    #   Media:  photo(1).jpg
-    #   JSON:   photo.jpg(1).json  OR  photo.JPG(1).json  (case may differ!)
-    m = re.match(r"^(.+)\((\d+)\)$", stem)
-    if m:
-        base, num = m.group(1), m.group(2)
-        # Try with various extension cases
-        for ext_variant in (suffix, suffix.upper(), suffix.lower()):
-            r = _try_all_suffixes(f"{base}{ext_variant}({num})")
-            if r:
-                return r
-        # Also try: base(N).json directly
-        r = _try_all_suffixes(f"{base}({num})")
+    # --- Rule 3: Extension equivalents (.jpg ↔ .jpeg) ---
+    alt_exts = _EXT_EQUIVALENTS.get(media_suffix.lower(), [])
+    for alt_ext in alt_exts:
+        alt_name = media_stem + alt_ext
+        r = prefix_match(alt_name)
         if r:
             return r
 
-    # --- Rule 5: -edited / -cropped fallback ---
-    # These files have NO own JSON; fall back to the original's JSON.
-    for edit_suffix in ("-edited", "-cropped", "-edit", "-edi"):
-        if stem.lower().endswith(edit_suffix):
-            original_stem = stem[: -len(edit_suffix)]
-            original_name = original_stem + suffix
-            r = _try_all_suffixes(original_name)
+    # --- Rule 4: Truncated filenames (46/47/51 char limits) ---
+    for trunc_len in (46, 47, 51):
+        if len(media_name) > trunc_len:
+            r = prefix_match(media_name[:trunc_len])
+            if r:
+                return r
+
+        if len(media_stem) > trunc_len:
+            r = prefix_match(media_stem[:trunc_len] + media_suffix)
+            if r:
+                return r
+
+    # --- Rule 5: Numbered duplicates ---
+    # Google places the number differently:
+    #   Media:  photo(1).jpg
+    #   JSON:   photo.jpg(1).json  OR  photo.JPG(1).supplemental-metadata.json
+    m = re.match(r"^(.+)\((\d+)\)$", media_stem)
+    if m:
+        base, num = m.group(1), m.group(2)
+        # Try with various extension cases
+        for ext_variant in {media_suffix, media_suffix.upper(), media_suffix.lower()}:
+            r = prefix_match(f"{base}{ext_variant}({num})")
+            if r:
+                return r
+        # Also try: base(N) directly (stem-only variant)
+        r = prefix_match(f"{base}({num})")
+        if r:
+            return r
+        # And: base.ext(N) with alt extensions
+        for alt_ext in alt_exts:
+            r = prefix_match(f"{base}{alt_ext}({num})")
+            if r:
+                return r
+
+    # --- Rule 6: -edited / -cropped / -bearbeitet fallback ---
+    # These files often have NO own JSON; fall back to the original's JSON.
+    for edit_suffix in ("-edited", "-cropped", "-bearbeitet", "-edit", "-edi", "-ed"):
+        if media_stem.lower().endswith(edit_suffix):
+            original_stem = media_stem[: -len(edit_suffix)]
+            original_name = original_stem + media_suffix
+            r = prefix_match(original_name)
             if r:
                 return r
             r = lookup(original_stem + ".json")
             if r:
                 return r
+            # Also try alt extensions
+            for alt_ext in alt_exts:
+                r = prefix_match(original_stem + alt_ext)
+                if r:
+                    return r
 
-    # --- Rule 6: Fuzzy match via JSON title field ---
-    # Google may substitute &?;' with _ in filenames but keeps originals in
-    # the JSON title. Also handles other naming mismatches.
-    # Build reverse lookup: read JSON files and check if their "title" matches.
-    name_lower = name.lower()
-    # Also create a version where special chars are normalized
-    name_normalized = name.lower().translate(_SPECIAL_CHAR_MAP)
+    # --- Rule 7: Fuzzy match via JSON title field (same directory) ---
+    name_lower = media_name.lower()
+    name_normalized = media_name.lower().translate(_SPECIAL_CHAR_MAP)
+    stem_lower = media_stem.lower()
 
     for json_name, json_file in json_map.items():
         try:
@@ -447,14 +429,80 @@ def _find_json(media_path: Path) -> Optional[Path]:
                 continue
             title_lower = title.lower()
             title_normalized = title_lower.translate(_SPECIAL_CHAR_MAP)
-            # Match: exact, or after special-char normalization
-            if title_lower == name_lower or title_normalized == name_normalized:
-                return json_file
-            # Also match if title equals stem (without extension)
-            if title_lower == stem.lower():
+            if (title_lower == name_lower
+                    or title_normalized == name_normalized
+                    or title_normalized == name_lower
+                    or title_lower == name_normalized
+                    or title_lower == stem_lower):
                 return json_file
         except (json.JSONDecodeError, OSError):
             continue
+
+    return None
+
+
+def _build_title_index(temp_dir: Path) -> None:
+    """Build a global index of JSON title → file path for cross-directory matching."""
+    global _title_index, _title_index_built
+    if _title_index_built:
+        return
+    for json_file in temp_dir.rglob("*.json"):
+        if not json_file.is_file():
+            continue
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            title = data.get("title", "")
+            if title:
+                key = title.lower()
+                # Keep the first match (year folders are more complete)
+                if key not in _title_index:
+                    _title_index[key] = json_file
+        except (json.JSONDecodeError, OSError):
+            continue
+    _title_index_built = True
+
+
+def _find_json(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[Path]:
+    """Find the Google Takeout JSON sidecar for a media file.
+
+    Covers ALL known Google Takeout naming schemes:
+      - Old format:  photo.jpg.json
+      - New format:  photo.jpg.supplemental-metadata.json (+ all truncation variants)
+      - Stem only:   photo.json
+      - Truncated filenames (46/47/51 char limits)
+      - Numbered duplicates with misplaced parenthesis & extension case mismatch
+      - Extension equivalents (.jpg ↔ .jpeg)
+      - -edited/-cropped/-bearbeitet fallback to original file's JSON
+      - Special character substitution (&?;' → _)
+      - Prefix-based matching (catches ANY supplemental-metadata truncation)
+      - Fuzzy match via JSON title field
+      - Cross-directory matching (JSON in album folder, media in year folder)
+    """
+    name = media_path.name
+    stem = media_path.stem
+    suffix = media_path.suffix
+
+    # Try same-directory matching first (fastest)
+    json_map = _get_json_map(media_path.parent)
+    if json_map:
+        r = _find_json_in_map(json_map, name, stem, suffix)
+        if r:
+            return r
+
+    # Cross-directory: try global title index
+    if temp_dir:
+        _build_title_index(temp_dir)
+        name_lower = name.lower()
+        name_normalized = name.lower().translate(_SPECIAL_CHAR_MAP)
+        # Check by original filename
+        r = _title_index.get(name_lower)
+        if r:
+            return r
+        # Check by normalized filename
+        r = _title_index.get(name_normalized)
+        if r:
+            return r
 
     return None
 
@@ -463,11 +511,11 @@ def _find_json(media_path: Path) -> Optional[Path]:
 # Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_file(media_path: Path) -> Optional[dict]:
+def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[dict]:
     """Analyze a single file and return a row dict if there is a mismatch,
     or None if everything is consistent.
     """
-    json_path = _find_json(media_path)
+    json_path = _find_json(media_path, temp_dir=temp_dir)
 
     fn_date = date_from_filename(media_path)
     json_date = date_from_json(json_path) if json_path else None
@@ -712,7 +760,7 @@ def main():
         task = progress.add_task("Metadaten prüfen", total=len(media_files))
         for mf in media_files:
             try:
-                row = analyze_file(mf)
+                row = analyze_file(mf, temp_dir=temp_dir)
                 if row:
                     mismatch_rows.append(row)
             except Exception as e:
