@@ -444,7 +444,7 @@ def _find_json_in_map(json_map: dict, media_name: str, media_stem: str,
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             title = data.get("title", "")
-            if not title:
+            if not title or not isinstance(title, str):
                 continue
             title_lower = title.lower()
             title_normalized = title_lower.translate(_SPECIAL_CHAR_MAP)
@@ -472,7 +472,7 @@ def _build_title_index(temp_dir: Path) -> None:
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             title = data.get("title", "")
-            if title:
+            if title and isinstance(title, str):
                 key = title.lower()
                 # Keep the first match (year folders are more complete)
                 if key not in _title_index:
