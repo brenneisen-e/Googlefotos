@@ -292,6 +292,8 @@ def date_from_mtime(filepath: Path) -> datetime:
 
 # Cache for JSON maps per directory (avoids re-scanning the same folder)
 _json_map_cache: dict = {}
+# Per-directory title index: maps normalized title → json Path
+_dir_title_cache: dict = {}
 # Global title index: maps normalized title → json Path (built lazily)
 _title_index: dict = {}
 _title_index_built = False
@@ -434,28 +436,40 @@ def _find_json_in_map(json_map: dict, media_name: str, media_stem: str,
         if r:
             return r
 
-    # --- Rule 8: Fuzzy match via JSON title field (same directory) ---
+    # --- Rule 8: Title-based match (cached per directory) ---
+    # Instead of reading every JSON on each miss, build a per-directory
+    # title→path index once and reuse it.
+    dir_key = id(json_map)  # same json_map object = same directory
+    if dir_key not in _dir_title_cache:
+        title_map = {}
+        for json_name, json_file in json_map.items():
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                title = data.get("title", "")
+                if title and isinstance(title, str):
+                    title_lower = title.lower()
+                    title_normalized = title_lower.translate(_SPECIAL_CHAR_MAP)
+                    title_map[title_lower] = json_file
+                    if title_normalized != title_lower:
+                        title_map[title_normalized] = json_file
+                    # Also index by stem (without extension)
+                    title_stem = Path(title).stem.lower()
+                    if title_stem not in title_map:
+                        title_map[title_stem] = json_file
+            except (json.JSONDecodeError, OSError):
+                continue
+        _dir_title_cache[dir_key] = title_map
+    else:
+        title_map = _dir_title_cache[dir_key]
+
     name_lower = media_name.lower()
     name_normalized = media_name.lower().translate(_SPECIAL_CHAR_MAP)
     stem_lower = media_stem.lower()
 
-    for json_name, json_file in json_map.items():
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            title = data.get("title", "")
-            if not title or not isinstance(title, str):
-                continue
-            title_lower = title.lower()
-            title_normalized = title_lower.translate(_SPECIAL_CHAR_MAP)
-            if (title_lower == name_lower
-                    or title_normalized == name_normalized
-                    or title_normalized == name_lower
-                    or title_lower == name_normalized
-                    or title_lower == stem_lower):
-                return json_file
-        except (json.JSONDecodeError, OSError):
-            continue
+    r = title_map.get(name_lower) or title_map.get(name_normalized) or title_map.get(stem_lower)
+    if r:
+        return r
 
     return None
 
@@ -764,8 +778,14 @@ def main():
         console.print("[yellow]Keine Medien-Dateien gefunden. Abbruch.[/yellow]")
         sys.exit(0)
 
-    # Phase 3: Analyze metadata
-    console.print(Panel("[bold]Phase 3: Metadaten analysieren[/bold]", border_style="green"))
+    # Phase 3: Build title index (for cross-directory matching)
+    console.print(Panel("[bold]Phase 3: JSON-Titel-Index aufbauen[/bold]", border_style="green"))
+    console.print("  Scanne alle JSON-Dateien für Cross-Directory-Matching...")
+    _build_title_index(temp_dir)
+    console.print(f"  {len(_title_index)} JSON-Titel indexiert\n")
+
+    # Phase 4: Analyze metadata
+    console.print(Panel("[bold]Phase 4: Metadaten analysieren[/bold]", border_style="green"))
     mismatch_rows = []
 
     with Progress(
@@ -805,8 +825,8 @@ def main():
     # Sort by filename for readability
     mismatch_rows.sort(key=lambda r: r["Datei"])
 
-    # Phase 4: Write Excel
-    console.print(Panel("[bold]Phase 4: Excel-Report schreiben[/bold]", border_style="green"))
+    # Phase 5: Write Excel
+    console.print(Panel("[bold]Phase 5: Excel-Report schreiben[/bold]", border_style="green"))
     write_excel(mismatch_rows, output_path, len(media_files))
 
     console.print("\n[bold green]Fertig![/bold green]")
