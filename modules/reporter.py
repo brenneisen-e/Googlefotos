@@ -35,6 +35,7 @@ def write_repair_log(
             "new_filename": rr.get("new_filename", ""),
             "timestamp_used": pr.get("timestamp_used", ""),
             "timestamp_source": pr.get("timestamp_source", ""),
+            "json_date": pr.get("json_date", "") or "",
             "exif_written": str(pr.get("exif_written", False)),
             "exiftool_used": str(pr.get("exiftool_used", False)),
             "date_mismatch": pr.get("date_mismatch", ""),
@@ -43,7 +44,7 @@ def write_repair_log(
 
     fieldnames = [
         "original_path", "new_filename", "timestamp_used",
-        "timestamp_source", "exif_written", "exiftool_used",
+        "timestamp_source", "json_date", "exif_written", "exiftool_used",
         "date_mismatch", "status",
     ]
 

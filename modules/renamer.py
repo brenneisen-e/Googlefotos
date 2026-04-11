@@ -8,7 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+from modules.metadata import get_timestamp_from_json
+
 logger = logging.getLogger(__name__)
+
+# Folder name used when --cluster-by-json-date is active but a file has no
+# matching JSON (and therefore no "Google date" to cluster by).
+NO_JSON_DATE_FOLDER = "no_json_date"
 
 # Characters illegal in filenames across common filesystems
 ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -59,14 +65,26 @@ def copy_and_rename(
     dt: datetime,
     temp_dir: str,
     output_dir: str,
+    cluster_folder: Optional[str] = None,
 ) -> Tuple[Optional[Path], str]:
-    """Copy a media file to output with the new name and preserved subfolder structure.
+    """Copy a media file to output with the new name.
+
+    If ``cluster_folder`` is given (e.g. "2023-08-07"), the file is placed
+    into ``<output_dir>/<cluster_folder>/`` instead of preserving the
+    original Takeout subfolder structure. This is used by the
+    ``--cluster-by-json-date`` mode so every file that Google Photos
+    currently stamps with the same date ends up in the same folder,
+    ready for a delete+re-upload round-trip.
 
     Returns (new_path, status_string).
     """
     try:
         new_name = build_new_filename(media_path, dt)
-        subfolder = get_relative_subfolder(media_path, temp_dir)
+
+        if cluster_folder:
+            subfolder = Path(cluster_folder)
+        else:
+            subfolder = get_relative_subfolder(media_path, temp_dir)
 
         dest_dir = Path(output_dir) / subfolder
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -88,23 +106,58 @@ def copy_and_rename(
         return None, f"error: {e}"
 
 
+def _resolve_cluster_folder(
+    proc_result: dict,
+    json_path: Optional[Path],
+) -> str:
+    """Return the YYYY-MM-DD folder name for cluster-by-json-date mode.
+
+    Prefers the ``json_date`` field already stored in ``proc_result`` by
+    ``metadata.process_file``. Falls back to re-reading the JSON sidecar
+    (useful for resume scenarios where process_file was skipped). If no
+    JSON date can be determined, returns the NO_JSON_DATE_FOLDER sentinel.
+    """
+    json_date = proc_result.get("json_date")
+    if json_date and len(json_date) >= 10:
+        return json_date[:10]
+
+    if json_path:
+        try:
+            result = get_timestamp_from_json(json_path)
+        except Exception as e:
+            logger.debug("Cluster fallback: JSON re-read failed (%s): %s",
+                         json_path, e)
+            result = None
+        if result:
+            return result[0].strftime("%Y-%m-%d")
+
+    return NO_JSON_DATE_FOLDER
+
+
 def rename_all(
     matched_files: list,
     process_results: list,
     temp_dir: str,
     output_dir: str,
+    cluster_by_json_date: bool = False,
 ) -> list:
     """Rename and copy all files to output directory.
 
     matched_files: list of (media_path, json_path_or_None)
     process_results: list of dicts from metadata.process_file()
+    cluster_by_json_date: if True, place each file into a folder named
+        after the date Google currently shows (the JSON photoTakenTime),
+        e.g. ``2023-08-07/``. Files without a JSON go into
+        ``no_json_date/``. This lets the user delete a whole day in the
+        Google Photos UI and re-upload the matching folder in one round,
+        which fixes cluster-misdated imports at scale.
 
     Returns list of dicts with rename info.
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     rename_results = []
 
-    for (media_path, _json_path), proc_result in zip(matched_files, process_results):
+    for (media_path, json_path), proc_result in zip(matched_files, process_results):
         ts_str = proc_result.get("timestamp_used")
         if ts_str:
             dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -113,7 +166,14 @@ def rename_all(
             mtime = os.path.getmtime(media_path)
             dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
 
-        new_path, status = copy_and_rename(media_path, dt, temp_dir, output_dir)
+        cluster_folder = None
+        if cluster_by_json_date:
+            cluster_folder = _resolve_cluster_folder(proc_result, json_path)
+
+        new_path, status = copy_and_rename(
+            media_path, dt, temp_dir, output_dir,
+            cluster_folder=cluster_folder,
+        )
 
         rename_results.append({
             "original_path": str(media_path),

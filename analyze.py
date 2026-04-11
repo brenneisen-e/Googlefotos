@@ -16,6 +16,7 @@ import struct
 import sys
 import urllib.parse
 import zipfile
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -544,9 +545,22 @@ def _find_json(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[Pa
 # Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[dict]:
-    """Analyze a single file and return a row dict if there is a mismatch,
-    or None if everything is consistent.
+def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> dict:
+    """Analyze a single file and return an info dict.
+
+    The returned dict always contains the cluster keys below (so the caller
+    can build the "Cluster nach Google-Datum" overview even for files that
+    have no mismatch), plus an optional ``row`` entry with the detailed
+    row dict that goes into the "Abweichungen" sheet.
+
+    Keys:
+      - filename:       str
+      - json_date_key:  "YYYY-MM-DD" or None (the date Google currently shows)
+      - file_type:      "Foto" or "Video"
+      - has_alternative: bool — True if any non-JSON, non-mtime source
+                         (filename / EXIF / video metadata) produced a date.
+                         These files will be auto-corrected by repair.py.
+      - row:            dict or None — populated only on mismatch
     """
     json_path = _find_json(media_path, temp_dir=temp_dir)
 
@@ -555,6 +569,17 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[
     exif_date = date_from_exif(media_path)
     video_date = date_from_video_metadata(media_path)
     mtime_date = date_from_mtime(media_path)
+
+    ext = media_path.suffix.lower()
+    file_type = "Video" if ext in VIDEO_EXTENSIONS else "Foto"
+
+    info = {
+        "filename": media_path.name,
+        "json_date_key": json_date.strftime("%Y-%m-%d") if json_date else None,
+        "file_type": file_type,
+        "has_alternative": bool(fn_date or exif_date or video_date),
+        "row": None,
+    }
 
     # Collect all available dates
     sources = {}
@@ -593,24 +618,21 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> Optional[
         mismatch_details.append("Nur Änderungsdatum verfügbar (unsicher)")
     # If exactly 1 trustworthy source exists: no mismatch possible, skip
 
-    if not has_mismatch:
-        return None
+    if has_mismatch:
+        info["row"] = {
+            "Datei": media_path.name,
+            "Pfad": str(media_path.parent),
+            "Typ": file_type,
+            "Datum Dateiname": fn_date.strftime("%Y-%m-%d %H:%M:%S") if fn_date else "",
+            "Datum JSON": json_date.strftime("%Y-%m-%d %H:%M:%S") if json_date else "",
+            "Datum EXIF": exif_date.strftime("%Y-%m-%d %H:%M:%S") if exif_date else "",
+            "Datum Video-Meta": video_date.strftime("%Y-%m-%d %H:%M:%S") if video_date else "",
+            "Änderungsdatum": mtime_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "Abweichung": "; ".join(mismatch_details),
+            "JSON vorhanden": "Ja" if json_path else "Nein",
+        }
 
-    ext = media_path.suffix.lower()
-    file_type = "Video" if ext in VIDEO_EXTENSIONS else "Foto"
-
-    return {
-        "Datei": media_path.name,
-        "Pfad": str(media_path.parent),
-        "Typ": file_type,
-        "Datum Dateiname": fn_date.strftime("%Y-%m-%d %H:%M:%S") if fn_date else "",
-        "Datum JSON": json_date.strftime("%Y-%m-%d %H:%M:%S") if json_date else "",
-        "Datum EXIF": exif_date.strftime("%Y-%m-%d %H:%M:%S") if exif_date else "",
-        "Datum Video-Meta": video_date.strftime("%Y-%m-%d %H:%M:%S") if video_date else "",
-        "Änderungsdatum": mtime_date.strftime("%Y-%m-%d %H:%M:%S"),
-        "Abweichung": "; ".join(mismatch_details),
-        "JSON vorhanden": "Ja" if json_path else "Nein",
-    }
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -640,8 +662,75 @@ COLUMNS = [
     ("JSON vorhanden", 14),
 ]
 
+CLUSTER_COLUMNS = [
+    ("JSON-Datum (Google zeigt)", 24),
+    ("Betroffen", 12),
+    ("Gesamt", 10),
+    ("Fotos", 10),
+    ("Videos", 10),
+    ("Reparierbar", 14),
+    ("Problematisch", 15),
+]
 
-def write_excel(rows: list, output_path: Path, total_files: int):
+
+def build_cluster_summary(file_infos: list) -> list:
+    """Aggregate per-file info into cluster rows keyed by JSON date.
+
+    Each entry counts everything Google Photos currently stamps with that
+    date — both files with a real mismatch and files where JSON agrees
+    with the filename/EXIF. The Gesamt column matches what you would be
+    deleting in Google Photos when you wipe that day. Only JSON dates
+    that actually have at least one affected file are returned.
+
+    Sorted by "Betroffen" descending so the worst clusters come first.
+    """
+    buckets = defaultdict(lambda: {
+        "total": 0,
+        "fotos": 0,
+        "videos": 0,
+        "mismatched": 0,
+        "reparierbar": 0,
+        "problematisch": 0,
+    })
+
+    for info in file_infos:
+        key = info.get("json_date_key")
+        if not key:
+            continue
+        b = buckets[key]
+        b["total"] += 1
+        if info.get("file_type") == "Video":
+            b["videos"] += 1
+        else:
+            b["fotos"] += 1
+        if info.get("row"):
+            b["mismatched"] += 1
+            if info.get("has_alternative"):
+                b["reparierbar"] += 1
+            else:
+                b["problematisch"] += 1
+
+    rows = []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        if b["mismatched"] == 0:
+            continue
+        rows.append({
+            "JSON-Datum (Google zeigt)": key,
+            "Betroffen": b["mismatched"],
+            "Gesamt": b["total"],
+            "Fotos": b["fotos"],
+            "Videos": b["videos"],
+            "Reparierbar": b["reparierbar"],
+            "Problematisch": b["problematisch"],
+        })
+
+    rows.sort(key=lambda r: (-r["Betroffen"], r["JSON-Datum (Google zeigt)"]))
+    return rows
+
+
+def write_excel(rows: list, output_path: Path, total_files: int,
+                cluster_rows: Optional[list] = None):
     """Write the mismatch report as a formatted Excel file."""
     wb = Workbook()
 
@@ -669,7 +758,49 @@ def write_excel(rows: list, output_path: Path, total_files: int):
     ws_summary.column_dimensions["A"].width = 25
     ws_summary.column_dimensions["B"].width = 30
 
-    # --- Sheet 2: Abweichungen ---
+    # --- Sheet 2: Cluster nach Google-Datum ---
+    ws_cluster = wb.create_sheet("Cluster nach Google-Datum")
+    ws_cluster.sheet_properties.tabColor = "C00000"
+
+    ws_cluster["A1"] = (
+        "Cluster nach Google-Datum  –  so viele Dateien datiert Google Photos "
+        "pro Tag. 'Betroffen' = Abweichung erkannt, 'Gesamt' = alles was du "
+        "beim Delete-und-Re-Upload-Workflow mitnimmst."
+    )
+    ws_cluster["A1"].font = Font(name="Calibri", italic=True, size=9, color="595959")
+    ws_cluster.merge_cells(
+        start_row=1, start_column=1,
+        end_row=1, end_column=len(CLUSTER_COLUMNS),
+    )
+    ws_cluster.row_dimensions[1].height = 22
+
+    for col_idx, (col_name, col_width) in enumerate(CLUSTER_COLUMNS, start=1):
+        cell = ws_cluster.cell(row=2, column=col_idx, value=col_name)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws_cluster.column_dimensions[get_column_letter(col_idx)].width = col_width
+
+    ws_cluster.auto_filter.ref = f"A2:{get_column_letter(len(CLUSTER_COLUMNS))}2"
+    ws_cluster.freeze_panes = "A3"
+
+    cluster_rows = cluster_rows or []
+    for row_idx, cr in enumerate(cluster_rows, start=3):
+        for col_idx, (col_name, _) in enumerate(CLUSTER_COLUMNS, start=1):
+            cell = ws_cluster.cell(row=row_idx, column=col_idx, value=cr.get(col_name, ""))
+            cell.border = THIN_BORDER
+            cell.font = Font(name="Calibri", size=10)
+            if col_name == "Betroffen" and cr.get("Betroffen", 0) > 0:
+                cell.fill = MISMATCH_FILL
+            if col_name == "Problematisch" and cr.get("Problematisch", 0) > 0:
+                cell.fill = PatternFill(
+                    start_color="F4CCCC", end_color="F4CCCC", fill_type="solid"
+                )
+            if col_name in ("Betroffen", "Gesamt", "Fotos", "Videos",
+                            "Reparierbar", "Problematisch"):
+                cell.alignment = Alignment(horizontal="right")
+
+    # --- Sheet 3: Abweichungen ---
     ws = wb.create_sheet("Abweichungen")
     ws.sheet_properties.tabColor = "ED7D31"
 
@@ -696,6 +827,11 @@ def write_excel(rows: list, output_path: Path, total_files: int):
     wb.save(str(output_path))
     console.print(f"\n[bold green]Excel-Report gespeichert:[/bold green] {output_path}")
     console.print(f"  {len(rows)} Dateien mit Metadaten-Abweichung von {total_files} gesamt")
+    if cluster_rows:
+        console.print(
+            f"  {len(cluster_rows)} verschiedene JSON-Daten mit Abweichungen "
+            f"(siehe Sheet 'Cluster nach Google-Datum')"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +922,7 @@ def main():
 
     # Phase 4: Analyze metadata
     console.print(Panel("[bold]Phase 4: Metadaten analysieren[/bold]", border_style="green"))
-    mismatch_rows = []
+    file_infos = []
 
     with Progress(
         SpinnerColumn(),
@@ -799,35 +935,48 @@ def main():
         task = progress.add_task("Metadaten prüfen", total=len(media_files))
         for mf in media_files:
             try:
-                row = analyze_file(mf, temp_dir=temp_dir)
-                if row:
-                    mismatch_rows.append(row)
+                info = analyze_file(mf, temp_dir=temp_dir)
+                file_infos.append(info)
             except Exception as e:
                 logger.error("Fehler bei %s: %s", mf.name, e)
             progress.advance(task)
 
     # Deduplicate: same file can appear in album + year folder.
     # Keep only one entry per filename (the one with the most metadata).
-    seen = {}
-    for row in mismatch_rows:
-        key = row["Datei"].lower()
-        if key not in seen:
-            seen[key] = row
-        else:
-            # Keep the one with more filled date fields
-            old = seen[key]
-            old_count = sum(1 for c in ("Datum Dateiname", "Datum JSON", "Datum EXIF", "Datum Video-Meta") if old.get(c))
-            new_count = sum(1 for c in ("Datum Dateiname", "Datum JSON", "Datum EXIF", "Datum Video-Meta") if row.get(c))
-            if new_count > old_count:
-                seen[key] = row
-    mismatch_rows = list(seen.values())
+    # We dedup ALL infos (not just mismatches) so the cluster summary stays
+    # consistent with the Abweichungen sheet.
+    def _row_info_score(info: dict) -> int:
+        row = info.get("row") or {}
+        return sum(
+            1 for c in ("Datum Dateiname", "Datum JSON",
+                        "Datum EXIF", "Datum Video-Meta")
+            if row.get(c)
+        )
 
-    # Sort by filename for readability
+    seen = {}
+    for info in file_infos:
+        fname = info.get("filename") or ""
+        key = fname.lower()
+        if not key:
+            continue
+        if key not in seen:
+            seen[key] = info
+        else:
+            old = seen[key]
+            if _row_info_score(info) > _row_info_score(old):
+                seen[key] = info
+    file_infos = list(seen.values())
+
+    # Extract the mismatch rows (for the "Abweichungen" sheet) and the
+    # cluster aggregation (for the "Cluster nach Google-Datum" sheet).
+    mismatch_rows = [i["row"] for i in file_infos if i.get("row")]
     mismatch_rows.sort(key=lambda r: r["Datei"])
+    cluster_rows = build_cluster_summary(file_infos)
 
     # Phase 5: Write Excel
     console.print(Panel("[bold]Phase 5: Excel-Report schreiben[/bold]", border_style="green"))
-    write_excel(mismatch_rows, output_path, len(media_files))
+    write_excel(mismatch_rows, output_path, len(media_files),
+                cluster_rows=cluster_rows)
 
     console.print("\n[bold green]Fertig![/bold green]")
 
