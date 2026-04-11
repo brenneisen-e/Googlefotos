@@ -11,6 +11,7 @@ import logging
 import math
 import random
 import shutil
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -85,6 +86,13 @@ def parse_args():
     parser.add_argument(
         "--resume", action="store_true",
         help="Resume a previous run, skipping already-processed files",
+    )
+    parser.add_argument(
+        "--cluster-by-json-date", action="store_true",
+        help="Group output files into folders named after the date Google "
+             "currently shows (JSON photoTakenTime, YYYY-MM-DD). Perfect for "
+             "fixing cluster-misdated imports: delete all photos from one "
+             "day in Google Photos, then re-upload the matching folder.",
     )
     return parser.parse_args()
 
@@ -254,6 +262,8 @@ def print_config(args, exiftool_ok: bool):
         table.add_row("Sample mode", f"{args.sample} files (seed=42)")
     if args.resume:
         table.add_row("Resume mode", "ON (skip already-processed)")
+    if args.cluster_by_json_date:
+        table.add_row("Cluster mode", "ON (folders by JSON date)")
     console.print(table)
     console.print()
 
@@ -439,6 +449,7 @@ def main():
                         "exif_written": False,
                         "exiftool_used": False,
                         "date_mismatch": None,
+                        "json_date": None,
                         "status": "skipped_resume",
                     })
                     skipped_resume_count += 1
@@ -480,6 +491,7 @@ def main():
                         "exif_written": False,
                         "exiftool_used": False,
                         "date_mismatch": None,
+                        "json_date": None,
                         "status": f"error: {e}",
                     })
 
@@ -537,7 +549,8 @@ def main():
                 results_to_rename.append(pr)
 
         new_rename_results = rename_all(
-            files_to_rename, results_to_rename, effective_temp, effective_output
+            files_to_rename, results_to_rename, effective_temp, effective_output,
+            cluster_by_json_date=args.cluster_by_json_date,
         )
 
         # Mark newly renamed files
@@ -550,7 +563,8 @@ def main():
         rename_results = rename_results_skipped + new_rename_results
     else:
         rename_results = rename_all(
-            matched_files, process_results, effective_temp, effective_output
+            matched_files, process_results, effective_temp, effective_output,
+            cluster_by_json_date=args.cluster_by_json_date,
         )
         if resume_conn:
             for rr in rename_results:

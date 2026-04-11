@@ -72,15 +72,97 @@ FILENAME_DATE_PATTERNS = [
     (re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)"), False),
 ]
 
-_exiftool_available: Optional[bool] = None
+_exiftool_path: Optional[str] = None
+_exiftool_checked: bool = False
+
+
+def find_exiftool() -> Optional[str]:
+    """Locate the ExifTool executable.
+
+    Lookup order:
+      1. System PATH (``shutil.which("exiftool")``)
+      2. Project-local subdirectories matching ``exiftool*/`` — specifically
+         looks for ``exiftool.exe`` (Windows, renamed) or ``exiftool`` (Unix)
+         inside any such subdirectory, both in the current working directory
+         and next to this package.
+
+    Important: ExifTool's Windows archive ships as ``exiftool(-k).exe``.
+    That ``(-k)`` activates the "pause before exit" flag and would make
+    subprocess calls hang. This discovery intentionally only accepts the
+    **renamed** ``exiftool.exe``. If only the ``(-k)`` version exists, a
+    warning is logged once so the user knows what to do.
+
+    Returns the absolute path as a string, or None if not found.
+    Result is cached after the first call.
+    """
+    global _exiftool_path, _exiftool_checked
+    if _exiftool_checked:
+        return _exiftool_path
+    _exiftool_checked = True
+
+    # 1. System PATH
+    path = shutil.which("exiftool")
+    if path:
+        _exiftool_path = path
+        logger.info("ExifTool found on PATH: %s", path)
+        return path
+
+    # 2. Project-local exiftool*/ subdirectories
+    search_roots = []
+    search_roots.append(Path.cwd())
+    try:
+        # Package root = parent of modules/
+        search_roots.append(Path(__file__).resolve().parent.parent)
+    except Exception:
+        pass
+
+    seen_dirs = set()
+    unrenamed_hits = []
+    for root in search_roots:
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:
+            continue
+        for sub in sorted(root.glob("exiftool*")):
+            if not sub.is_dir():
+                continue
+            key = str(sub.resolve())
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+
+            # Preferred: the renamed executable
+            for candidate_name in ("exiftool.exe", "exiftool"):
+                candidate = sub / candidate_name
+                if candidate.is_file():
+                    _exiftool_path = str(candidate.resolve())
+                    logger.info(
+                        "ExifTool found in project subdirectory: %s",
+                        _exiftool_path,
+                    )
+                    return _exiftool_path
+
+            # Fallback detection: unrenamed "(-k)" version
+            unrenamed = sub / "exiftool(-k).exe"
+            if unrenamed.is_file():
+                unrenamed_hits.append(str(unrenamed))
+
+    if unrenamed_hits:
+        logger.warning(
+            "ExifTool NOT usable: only the unrenamed 'exiftool(-k).exe' was "
+            "found at %s. Please rename it to 'exiftool.exe' (the '(-k)' "
+            "flag would make subprocess calls hang). ExifTool_files/ must "
+            "stay in the same folder.",
+            unrenamed_hits[0],
+        )
+
+    return None
 
 
 def check_exiftool() -> bool:
-    """Check if ExifTool is available on the system."""
-    global _exiftool_available
-    if _exiftool_available is None:
-        _exiftool_available = shutil.which("exiftool") is not None
-    return _exiftool_available
+    """Return True if ExifTool is available (PATH or project-local)."""
+    return find_exiftool() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +272,7 @@ def get_timestamp_from_mtime(filepath: Path) -> Tuple[datetime, str]:
 def resolve_timestamp(
     media_path: Path,
     json_path: Optional[Path],
-) -> Tuple[datetime, str, Optional[str]]:
+) -> Tuple[datetime, str, Optional[str], Optional[datetime]]:
     """Resolve the best timestamp for a media file.
 
     NEW PRIORITY:
@@ -199,12 +281,15 @@ def resolve_timestamp(
       3. Existing EXIF DateTimeOriginal
       4. File modification time (flagged)
 
-    Returns (datetime, source_label, mismatch_info_or_None).
+    Returns (datetime, source_label, mismatch_info_or_None, json_dt_or_None).
     mismatch_info is set when filename and JSON dates differ by >30 days.
+    json_dt is the JSON photoTakenTime datetime (even when it did not win),
+    so callers can cluster files by the date Google currently shows.
     """
     filename_result = get_timestamp_from_filename(media_path)
     json_result = get_timestamp_from_json(json_path) if json_path else None
     mismatch_info = None
+    json_dt = json_result[0] if json_result else None
 
     # Cross-validation: check if filename and JSON dates diverge
     if filename_result and json_result:
@@ -226,20 +311,20 @@ def resolve_timestamp(
 
     # Priority 1: Filename
     if filename_result:
-        return filename_result[0], filename_result[1], mismatch_info
+        return filename_result[0], filename_result[1], mismatch_info, json_dt
 
     # Priority 2: JSON
     if json_result:
-        return json_result[0], json_result[1], mismatch_info
+        return json_result[0], json_result[1], mismatch_info, json_dt
 
     # Priority 3: Existing EXIF
     exif_result = get_timestamp_from_exif(media_path)
     if exif_result:
-        return exif_result[0], exif_result[1], mismatch_info
+        return exif_result[0], exif_result[1], mismatch_info, json_dt
 
     # Priority 4: File mtime (flagged)
     mtime_dt, mtime_source = get_timestamp_from_mtime(media_path)
-    return mtime_dt, mtime_source, mismatch_info
+    return mtime_dt, mtime_source, mismatch_info, json_dt
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +376,8 @@ def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
 
 def write_exif_exiftool(filepath: Path, dt: datetime) -> bool:
     """Write EXIF dates to HEIC/video files using ExifTool subprocess."""
-    if not check_exiftool():
+    exiftool_path = find_exiftool()
+    if not exiftool_path:
         return False
 
     date_str = dt.strftime("%Y:%m:%d %H:%M:%S")
@@ -299,7 +385,7 @@ def write_exif_exiftool(filepath: Path, dt: datetime) -> bool:
     try:
         result = subprocess.run(
             [
-                "exiftool",
+                exiftool_path,
                 f"-DateTimeOriginal={date_str}",
                 f"-CreateDate={date_str}",
                 "-overwrite_original",
@@ -345,14 +431,18 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         "exif_written": False,
         "exiftool_used": False,
         "date_mismatch": None,
+        "json_date": None,
         "status": "ok",
     }
 
     try:
-        dt, source, mismatch = resolve_timestamp(media_path, json_path)
+        dt, source, mismatch, json_dt = resolve_timestamp(media_path, json_path)
         result["timestamp_used"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         result["timestamp_source"] = source
         result["date_mismatch"] = mismatch
+        result["json_date"] = (
+            json_dt.strftime("%Y-%m-%d %H:%M:%S") if json_dt else None
+        )
 
         # Flag file_mtime as low-confidence
         if source == "file_mtime":
