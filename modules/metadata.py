@@ -450,9 +450,25 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
 
         ext = media_path.suffix.lower()
 
-        # Write EXIF based on file type
+        # Write EXIF based on file type.
+        #
+        # Priority for image formats:
+        #   1. piexif (fast, JPEG/TIFF only)
+        #   2. ExifTool fallback (covers PNG/WebP, plus any JPEG/TIFF
+        #      where piexif kapitulates on exotic/corrupt EXIF blocks —
+        #      ExifTool is far more forgiving than piexif).
         if ext in EXIF_IMAGE_EXTENSIONS:
-            result["exif_written"] = write_exif_piexif(media_path, dt)
+            written = write_exif_piexif(media_path, dt)
+            result["exif_written"] = written
+            if not written and check_exiftool():
+                written_et = write_exif_exiftool(media_path, dt)
+                if written_et:
+                    result["exif_written"] = True
+                    result["exiftool_used"] = True
+                    logger.debug(
+                        "ExifTool fallback succeeded for %s after piexif failed",
+                        media_path.name,
+                    )
         elif ext in EXIFTOOL_EXTENSIONS:
             written = write_exif_exiftool(media_path, dt)
             result["exif_written"] = written
