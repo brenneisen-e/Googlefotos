@@ -11,6 +11,10 @@ echo benannt sind, das Google Photos aktuell anzeigt.
 echo In jedem Ordner sind ALLE Dateien dieses Tages,
 echo alle mit korrigiertem EXIF/Datum.
 echo.
+echo Es werden NUR Tage kopiert, an denen mehr als
+echo 10 Dateien eine Abweichung haben. Kleine Cluster
+echo und Dateien ohne JSON werden uebersprungen.
+echo.
 echo ============================================
 echo.
 
@@ -86,7 +90,7 @@ if /i "%CONFIRM%"=="j" (
 echo [5/5] Repair-Lauf wird gestartet...
 echo.
 
-python repair.py --skip-extraction --temp temp_analyze --cluster-by-json-date
+python repair.py --skip-extraction --temp temp_analyze --cluster-by-json-date --min-cluster-mismatches 10 --skip-no-json-date
 
 echo.
 echo ============================================
@@ -102,7 +106,9 @@ echo das Google Photos AKTUELL anzeigt. Beispiel:
 echo.
 echo    output\2015-05-29\   ^(alle Dateien von diesem Tag^)
 echo    output\2023-08-07\   ^(alle Dateien von diesem Tag^)
-echo    output\no_json_date\ ^(Dateien ohne JSON-Sidecar^)
+echo.
+echo Nur Tage mit ^>10 Abweichungen sind enthalten.
+echo Dateien ohne JSON-Sidecar werden uebersprungen.
 echo.
 echo Workflow pro Ordner:
 echo   1. Google Photos oeffnen ^(photos.google.com^)
