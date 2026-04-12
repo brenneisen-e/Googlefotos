@@ -94,6 +94,18 @@ def parse_args():
              "fixing cluster-misdated imports: delete all photos from one "
              "day in Google Photos, then re-upload the matching folder.",
     )
+    parser.add_argument(
+        "--min-cluster-mismatches", type=int, default=0, metavar="N",
+        help="In cluster mode: only copy days whose number of mismatched "
+             "files (filename vs JSON > 30 days) is strictly greater than N. "
+             "Days with N or fewer mismatches are skipped entirely. "
+             "Default: 0 (copy every day).",
+    )
+    parser.add_argument(
+        "--skip-no-json-date", action="store_true",
+        help="In cluster mode: skip files that have no matched JSON sidecar "
+             "instead of dumping them into output/no_json_date/.",
+    )
     return parser.parse_args()
 
 
@@ -264,6 +276,13 @@ def print_config(args, exiftool_ok: bool):
         table.add_row("Resume mode", "ON (skip already-processed)")
     if args.cluster_by_json_date:
         table.add_row("Cluster mode", "ON (folders by JSON date)")
+        if args.min_cluster_mismatches > 0:
+            table.add_row(
+                "Min. cluster mismatches",
+                f"> {args.min_cluster_mismatches} (smaller clusters skipped)",
+            )
+        if args.skip_no_json_date:
+            table.add_row("Skip no_json_date", "ON (files without JSON skipped)")
     console.print(table)
     console.print()
 
@@ -548,10 +567,28 @@ def main():
                 files_to_rename.append((mp, jp))
                 results_to_rename.append(pr)
 
-        new_rename_results = rename_all(
-            files_to_rename, results_to_rename, effective_temp, effective_output,
-            cluster_by_json_date=args.cluster_by_json_date,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+        ) as progress:
+            rename_task = progress.add_task(
+                "Renaming & copying", total=len(files_to_rename)
+            )
+
+            def _advance(_name: str, _status: str) -> None:
+                progress.advance(rename_task)
+
+            new_rename_results = rename_all(
+                files_to_rename, results_to_rename, effective_temp, effective_output,
+                cluster_by_json_date=args.cluster_by_json_date,
+                min_cluster_mismatches=args.min_cluster_mismatches,
+                skip_no_json_date=args.skip_no_json_date,
+                progress_callback=_advance,
+            )
 
         # Mark newly renamed files
         if resume_conn:
@@ -562,10 +599,28 @@ def main():
 
         rename_results = rename_results_skipped + new_rename_results
     else:
-        rename_results = rename_all(
-            matched_files, process_results, effective_temp, effective_output,
-            cluster_by_json_date=args.cluster_by_json_date,
-        )
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+        ) as progress:
+            rename_task = progress.add_task(
+                "Renaming & copying", total=len(matched_files)
+            )
+
+            def _advance(_name: str, _status: str) -> None:
+                progress.advance(rename_task)
+
+            rename_results = rename_all(
+                matched_files, process_results, effective_temp, effective_output,
+                cluster_by_json_date=args.cluster_by_json_date,
+                min_cluster_mismatches=args.min_cluster_mismatches,
+                skip_no_json_date=args.skip_no_json_date,
+                progress_callback=_advance,
+            )
         if resume_conn:
             for rr in rename_results:
                 if rr["status"] == "ok":
@@ -574,11 +629,17 @@ def main():
 
     copy_ok = sum(1 for r in rename_results if r["status"] == "ok")
     copy_skip = sum(1 for r in rename_results if r["status"] == "skipped_resume")
-    copy_fail = len(rename_results) - copy_ok - copy_skip
+    skip_small = sum(1 for r in rename_results if r["status"] == "skipped_small_cluster")
+    skip_nojson = sum(1 for r in rename_results if r["status"] == "skipped_no_json_date")
+    copy_fail = len(rename_results) - copy_ok - copy_skip - skip_small - skip_nojson
 
     phase4_stats = {"files_copied": copy_ok, "copy_failures": copy_fail}
     if copy_skip:
         phase4_stats["skipped_resume"] = copy_skip
+    if skip_small:
+        phase4_stats["skipped_small_cluster"] = skip_small
+    if skip_nojson:
+        phase4_stats["skipped_no_json_date"] = skip_nojson
     print_phase_stats(phase4_stats)
 
     # ------------------------------------------------------------------
