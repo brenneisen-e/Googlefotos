@@ -4,3 +4,4 @@ imagehash
 rich
 tqdm
 openpyxl
+tzdata; sys_platform == 'win32'

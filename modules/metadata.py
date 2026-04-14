@@ -27,7 +27,31 @@ from typing import Optional, Tuple
 import piexif
 from PIL import Image
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover – Python < 3.9
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+# Google Photos stamps days in the user's local timezone, not UTC.
+# All filename prefixes, cluster folders and dates shown to the user must
+# therefore be rendered in this timezone — otherwise photos shot around
+# midnight get assigned to the wrong day.
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+
+
+def to_local(dt: datetime) -> datetime:
+    """Convert a datetime to the user's local timezone (Europe/Berlin).
+
+    Accepts naive datetimes (assumed UTC) and returns a timezone-aware
+    local datetime. This is the SINGLE source of truth for "what day is
+    this photo on" – call this before any ``strftime("%Y-%m-%d")`` used
+    for clustering, display or folder naming.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ)
 
 EXIF_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
 EXIFTOOL_EXTENSIONS = {".heic", ".heif", ".mp4", ".mov", ".avi", ".m4v"}
@@ -298,14 +322,14 @@ def resolve_timestamp(
         delta = abs((fn_dt - js_dt).days)
         if delta > MISMATCH_THRESHOLD_DAYS:
             mismatch_info = (
-                f"date_mismatch: filename={fn_dt.strftime('%Y-%m-%d')} "
-                f"json={js_dt.strftime('%Y-%m-%d')} delta={delta}d"
+                f"date_mismatch: filename={to_local(fn_dt).strftime('%Y-%m-%d')} "
+                f"json={to_local(js_dt).strftime('%Y-%m-%d')} delta={delta}d"
             )
             logger.info(
                 "Date mismatch for %s: filename=%s json=%s (delta=%dd, using filename)",
                 media_path.name,
-                fn_dt.strftime("%Y-%m-%d"),
-                js_dt.strftime("%Y-%m-%d"),
+                to_local(fn_dt).strftime("%Y-%m-%d"),
+                to_local(js_dt).strftime("%Y-%m-%d"),
                 delta,
             )
 
@@ -437,11 +461,14 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
 
     try:
         dt, source, mismatch, json_dt = resolve_timestamp(media_path, json_path)
-        result["timestamp_used"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        # Store timestamps rendered in the user's local timezone so all
+        # downstream consumers (filename builder, cluster folder, Excel)
+        # see the same day/time that Google Photos shows.
+        result["timestamp_used"] = to_local(dt).strftime("%Y-%m-%d %H:%M:%S")
         result["timestamp_source"] = source
         result["date_mismatch"] = mismatch
         result["json_date"] = (
-            json_dt.strftime("%Y-%m-%d %H:%M:%S") if json_dt else None
+            to_local(json_dt).strftime("%Y-%m-%d %H:%M:%S") if json_dt else None
         )
 
         # Flag file_mtime as low-confidence

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-from modules.metadata import get_timestamp_from_json
+from modules.metadata import LOCAL_TZ, get_timestamp_from_json, to_local
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,12 @@ def sanitize_filename(name: str) -> str:
 
 
 def build_new_filename(original_path: Path, dt: datetime) -> str:
-    """Build new filename: YYYY-MM-DD_HHMMSS_originalfilename.ext"""
-    prefix = dt.strftime("%Y-%m-%d_%H%M%S")
+    """Build new filename: YYYY-MM-DD_HHMMSS_originalfilename.ext
+
+    The prefix is rendered in the user's local timezone (Europe/Berlin)
+    so filenames match what Google Photos shows for that day.
+    """
+    prefix = to_local(dt).strftime("%Y-%m-%d_%H%M%S")
     stem = sanitize_filename(original_path.stem)
     ext = original_path.suffix.lower()
     return f"{prefix}_{stem}{ext}"
@@ -129,7 +133,7 @@ def _resolve_cluster_folder(
                          json_path, e)
             result = None
         if result:
-            return result[0].strftime("%Y-%m-%d")
+            return to_local(result[0]).strftime("%Y-%m-%d")
 
     return NO_JSON_DATE_FOLDER
 
@@ -226,7 +230,9 @@ def rename_all(
 
         ts_str = proc_result.get("timestamp_used")
         if ts_str:
-            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            # metadata.process_file stores this already rendered in LOCAL_TZ,
+            # so parse it back with LOCAL_TZ (not UTC) to preserve the day.
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
         else:
             # Fallback to file mtime
             mtime = os.path.getmtime(media_path)

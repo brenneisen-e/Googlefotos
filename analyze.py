@@ -8,6 +8,7 @@ and generates an Excel report of files where metadata dates diverge
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -18,8 +19,35 @@ import urllib.parse
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Optional, Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover – Python < 3.9
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
+# Google Photos groups photos by the user's LOCAL day, not UTC. A photo
+# shot on 2024-01-01 00:30 CET is 2023-12-31 23:30 UTC — if we cluster by
+# the UTC day we'd put it on the wrong date and undercount (420 files on
+# our side vs. 417 in Google Photos, because a handful of midnight shots
+# slid into the neighbouring day).
+LOCAL_TZ = ZoneInfo("Europe/Berlin")
+
+
+def to_local(dt: datetime) -> datetime:
+    """Return ``dt`` converted to the user's local timezone."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ)
+
+
+def _fmt_local(dt: Optional[datetime], fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Format a datetime in local time, or "" if None."""
+    if dt is None:
+        return ""
+    return to_local(dt).strftime(fmt)
 
 try:
     from openpyxl import Workbook
@@ -573,9 +601,17 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> dict:
     ext = media_path.suffix.lower()
     file_type = "Video" if ext in VIDEO_EXTENSIONS else "Foto"
 
+    # "Best guess" local date, used for duplicate grouping. Preference order
+    # matches the metadata priority: filename > JSON > EXIF > video-meta > mtime.
+    best_date = fn_date or json_date or exif_date or video_date or mtime_date
+    best_date_key = to_local(best_date).strftime("%Y-%m-%d") if best_date else None
+
     info = {
         "filename": media_path.name,
-        "json_date_key": json_date.strftime("%Y-%m-%d") if json_date else None,
+        "path": str(media_path),
+        # Cluster by the LOCAL day Google Photos shows, not by UTC day.
+        "json_date_key": to_local(json_date).strftime("%Y-%m-%d") if json_date else None,
+        "best_date_key": best_date_key,
         "file_type": file_type,
         "has_alternative": bool(fn_date or exif_date or video_date),
         "row": None,
@@ -623,11 +659,11 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> dict:
             "Datei": media_path.name,
             "Pfad": str(media_path.parent),
             "Typ": file_type,
-            "Datum Dateiname": fn_date.strftime("%Y-%m-%d %H:%M:%S") if fn_date else "",
-            "Datum JSON": json_date.strftime("%Y-%m-%d %H:%M:%S") if json_date else "",
-            "Datum EXIF": exif_date.strftime("%Y-%m-%d %H:%M:%S") if exif_date else "",
-            "Datum Video-Meta": video_date.strftime("%Y-%m-%d %H:%M:%S") if video_date else "",
-            "Änderungsdatum": mtime_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "Datum Dateiname": _fmt_local(fn_date),
+            "Datum JSON": _fmt_local(json_date),
+            "Datum EXIF": _fmt_local(exif_date),
+            "Datum Video-Meta": _fmt_local(video_date),
+            "Änderungsdatum": _fmt_local(mtime_date),
             "Abweichung": "; ".join(mismatch_details),
             "JSON vorhanden": "Ja" if json_path else "Nein",
         }
@@ -671,6 +707,124 @@ CLUSTER_COLUMNS = [
     ("Reparierbar", 14),
     ("Problematisch", 15),
 ]
+
+DUPLICATE_COLUMNS = [
+    ("Datum", 14),
+    ("Datei", 40),
+    ("Pfad", 55),
+    ("Größe (Bytes)", 14),
+    ("Dublette von", 40),
+    ("Pfad Original", 55),
+    ("MD5", 34),
+    ("Gruppengröße", 14),
+]
+
+
+# ---------------------------------------------------------------------------
+# Duplicate detection (exact-byte match, grouped per local day)
+# ---------------------------------------------------------------------------
+
+def _md5_of_file(filepath: str) -> Tuple[str, Optional[str], int]:
+    """Worker: compute MD5 and file size for one file.
+
+    Returns (filepath, md5_hex or None on error, size_bytes).
+    Top-level function so it is picklable for multiprocessing.Pool.
+    """
+    try:
+        size = os.path.getsize(filepath)
+        h = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return (filepath, h.hexdigest(), size)
+    except OSError:
+        return (filepath, None, 0)
+
+
+def compute_md5_map(filepaths: list) -> dict:
+    """Compute MD5 + size for each file in parallel.
+
+    Returns: dict filepath → {"md5": str, "size": int}
+    Files that cannot be read are silently omitted.
+    """
+    if not filepaths:
+        return {}
+
+    num_workers = max(1, cpu_count() - 1)
+    out: dict = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeElapsedColumn(),
+    ) as progress:
+        task = progress.add_task("MD5 berechnen", total=len(filepaths))
+        try:
+            with Pool(processes=num_workers) as pool:
+                for fp, md5, size in pool.imap_unordered(
+                    _md5_of_file, filepaths, chunksize=8
+                ):
+                    if md5:
+                        out[fp] = {"md5": md5, "size": size}
+                    progress.advance(task)
+        except Exception as e:
+            logger.warning("MD5 multiprocessing failed, sequential fallback: %s", e)
+            for fp in filepaths:
+                _, md5, size = _md5_of_file(fp)
+                if md5:
+                    out[fp] = {"md5": md5, "size": size}
+                progress.advance(task)
+
+    return out
+
+
+def detect_duplicates(file_infos: list, md5_map: dict) -> list:
+    """Find files with identical MD5 on the same local day.
+
+    Groups files by (md5, best_date_key). Any group with 2+ members is a
+    duplicate cluster. The lexicographically first filename is reported as
+    the "keeper"; every other member becomes a row in the Duplikate sheet.
+
+    Returns a flat list of row dicts (one per extra copy).
+    """
+    groups: dict = defaultdict(list)
+    for info in file_infos:
+        fp = info.get("path")
+        if not fp:
+            continue
+        entry = md5_map.get(fp)
+        if not entry:
+            continue
+        date_key = info.get("best_date_key") or "unbekannt"
+        groups[(entry["md5"], date_key)].append({
+            "filename": info.get("filename", ""),
+            "path": fp,
+            "size": entry["size"],
+        })
+
+    rows = []
+    for (md5, date_key), members in groups.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: (m["filename"].lower(), m["path"]))
+        keeper = members[0]
+        for m in members[1:]:
+            rows.append({
+                "Datum": date_key,
+                "Datei": m["filename"],
+                "Pfad": str(Path(m["path"]).parent),
+                "Größe (Bytes)": m["size"],
+                "Dublette von": keeper["filename"],
+                "Pfad Original": str(Path(keeper["path"]).parent),
+                "MD5": md5,
+                "Gruppengröße": len(members),
+            })
+
+    rows.sort(key=lambda r: (r["Datum"], r["MD5"], r["Datei"]))
+    return rows
 
 
 def build_cluster_summary(file_infos: list) -> list:
@@ -730,9 +884,11 @@ def build_cluster_summary(file_infos: list) -> list:
 
 
 def write_excel(rows: list, output_path: Path, total_files: int,
-                cluster_rows: Optional[list] = None):
+                cluster_rows: Optional[list] = None,
+                duplicate_rows: Optional[list] = None):
     """Write the mismatch report as a formatted Excel file."""
     wb = Workbook()
+    duplicate_rows = duplicate_rows or []
 
     # --- Sheet 1: Zusammenfassung ---
     ws_summary = wb.active
@@ -745,6 +901,7 @@ def write_excel(rows: list, output_path: Path, total_files: int,
         ("Dateien mit Abweichung", len(rows)),
         ("Anteil mit Abweichung", f"{len(rows)/max(total_files,1)*100:.1f}%"),
         ("Schwellenwert", f"{MISMATCH_THRESHOLD_DAYS} Tage"),
+        ("Dubletten (gleiches Datum, gleicher Inhalt)", len(duplicate_rows)),
     ]
 
     ws_summary["A1"] = "Google Photos Metadaten-Analyse"
@@ -824,6 +981,44 @@ def write_excel(rows: list, output_path: Path, total_files: int,
             if col_name == "Abweichung":
                 cell.fill = MISMATCH_FILL
 
+    # --- Sheet 4: Duplikate ---
+    ws_dup = wb.create_sheet("Duplikate")
+    ws_dup.sheet_properties.tabColor = "7030A0"
+
+    ws_dup["A1"] = (
+        "Duplikate  –  Dateien mit exakt gleichem Inhalt (MD5) am gleichen "
+        "Tag (lokale Zeitzone). 'Dublette von' ist der behaltene Kandidat; "
+        "alle hier gelisteten Zeilen sind zusätzliche Kopien und können "
+        "gelöscht werden."
+    )
+    ws_dup["A1"].font = Font(name="Calibri", italic=True, size=9, color="595959")
+    ws_dup.merge_cells(
+        start_row=1, start_column=1,
+        end_row=1, end_column=len(DUPLICATE_COLUMNS),
+    )
+    ws_dup.row_dimensions[1].height = 22
+
+    for col_idx, (col_name, col_width) in enumerate(DUPLICATE_COLUMNS, start=1):
+        cell = ws_dup.cell(row=2, column=col_idx, value=col_name)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws_dup.column_dimensions[get_column_letter(col_idx)].width = col_width
+
+    ws_dup.auto_filter.ref = f"A2:{get_column_letter(len(DUPLICATE_COLUMNS))}2"
+    ws_dup.freeze_panes = "A3"
+
+    DUP_FILL = PatternFill(start_color="E4D5F2", end_color="E4D5F2", fill_type="solid")
+    for row_idx, dr in enumerate(duplicate_rows, start=3):
+        for col_idx, (col_name, _) in enumerate(DUPLICATE_COLUMNS, start=1):
+            cell = ws_dup.cell(row=row_idx, column=col_idx, value=dr.get(col_name, ""))
+            cell.border = THIN_BORDER
+            cell.font = Font(name="Calibri", size=10)
+            if col_name == "Datum":
+                cell.fill = DUP_FILL
+            if col_name in ("Größe (Bytes)", "Gruppengröße"):
+                cell.alignment = Alignment(horizontal="right")
+
     wb.save(str(output_path))
     console.print(f"\n[bold green]Excel-Report gespeichert:[/bold green] {output_path}")
     console.print(f"  {len(rows)} Dateien mit Metadaten-Abweichung von {total_files} gesamt")
@@ -831,6 +1026,11 @@ def write_excel(rows: list, output_path: Path, total_files: int,
         console.print(
             f"  {len(cluster_rows)} verschiedene JSON-Daten mit Abweichungen "
             f"(siehe Sheet 'Cluster nach Google-Datum')"
+        )
+    if duplicate_rows:
+        console.print(
+            f"  {len(duplicate_rows)} Duplikat-Zeile(n) "
+            f"(siehe Sheet 'Duplikate')"
         )
 
 
@@ -973,10 +1173,24 @@ def main():
     mismatch_rows.sort(key=lambda r: r["Datei"])
     cluster_rows = build_cluster_summary(file_infos)
 
-    # Phase 5: Write Excel
-    console.print(Panel("[bold]Phase 5: Excel-Report schreiben[/bold]", border_style="green"))
+    # Phase 5: Duplicate detection (MD5 + same local day)
+    console.print(Panel(
+        "[bold]Phase 5: Duplikate erkennen (MD5, gleicher Tag)[/bold]",
+        border_style="green",
+    ))
+    md5_paths = [i["path"] for i in file_infos if i.get("path")]
+    md5_map = compute_md5_map(md5_paths)
+    duplicate_rows = detect_duplicates(file_infos, md5_map)
+    console.print(
+        f"  {len(duplicate_rows)} Dublette(n) gefunden "
+        f"(exakt gleiche Bytes, gleiches Datum)\n"
+    )
+
+    # Phase 6: Write Excel
+    console.print(Panel("[bold]Phase 6: Excel-Report schreiben[/bold]", border_style="green"))
     write_excel(mismatch_rows, output_path, len(media_files),
-                cluster_rows=cluster_rows)
+                cluster_rows=cluster_rows,
+                duplicate_rows=duplicate_rows)
 
     console.print("\n[bold green]Fertig![/bold green]")
 
