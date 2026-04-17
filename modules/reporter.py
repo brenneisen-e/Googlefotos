@@ -38,6 +38,8 @@ def write_repair_log(
             "json_date": pr.get("json_date", "") or "",
             "exif_written": str(pr.get("exif_written", False)),
             "exiftool_used": str(pr.get("exiftool_used", False)),
+            "gps_written": str(pr.get("gps_written", False)),
+            "description_written": str(pr.get("description_written", False)),
             "date_mismatch": pr.get("date_mismatch", ""),
             "status": pr.get("status", rr.get("status", "")),
         })
@@ -45,6 +47,7 @@ def write_repair_log(
     fieldnames = [
         "original_path", "new_filename", "timestamp_used",
         "timestamp_source", "json_date", "exif_written", "exiftool_used",
+        "gps_written", "description_written",
         "date_mismatch", "status",
     ]
 
@@ -100,6 +103,8 @@ def write_summary(
     date_mismatches: int = 0,
     flagged_mtime: int = 0,
     source_counts: dict = None,
+    gps_written: int = 0,
+    description_written: int = 0,
 ) -> str:
     """Write summary.txt with overall statistics."""
     summary_path = Path(output_dir) / "summary.txt"
@@ -114,6 +119,8 @@ def write_summary(
         "",
         f"  Total files processed:         {total_files:>8}",
         f"  EXIF written:                  {exif_written:>8}",
+        f"  GPS written (from JSON):       {gps_written:>8}",
+        f"  Description written (JSON):    {description_written:>8}",
         f"  Timestamps set:                {timestamps_set:>8}",
         f"  Exact duplicates deleted:      {exact_dupes:>8}",
         f"  Visual duplicates deleted:     {visual_dupes:>8}",

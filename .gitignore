@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+*.log
+*.db
+input/
+output/
+output_sample/
+temp/
+temp_sample/
+temp_analyze/
+test_temp/
+test_output/
