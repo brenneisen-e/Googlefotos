@@ -441,6 +441,8 @@ def main():
     skipped_resume_count = 0
     date_mismatch_count = 0
     flagged_mtime_count = 0
+    gps_written_count = 0
+    description_written_count = 0
     source_counts = {}
 
     with Progress(
@@ -483,6 +485,10 @@ def main():
                         exif_written_count += 1
                     if result.get("exiftool_used"):
                         exiftool_used_count += 1
+                    if result.get("gps_written"):
+                        gps_written_count += 1
+                    if result.get("description_written"):
+                        description_written_count += 1
                     if result.get("timestamp_used"):
                         timestamps_set_count += 1
                     else:
@@ -523,6 +529,8 @@ def main():
     phase3_stats = {
         "exif_written": exif_written_count,
         "exiftool_used": exiftool_used_count,
+        "gps_written": gps_written_count,
+        "description_written": description_written_count,
         "timestamps_set": timestamps_set_count,
         "no_timestamp": no_timestamp_count,
     }
@@ -703,6 +711,8 @@ def main():
         date_mismatches=date_mismatch_count,
         flagged_mtime=flagged_mtime_count,
         source_counts=source_counts,
+        gps_written=gps_written_count,
+        description_written=description_written_count,
     )
 
     console.print(f"  Repair log:        {repair_log_path}")
@@ -718,6 +728,8 @@ def main():
     final_table.add_column("Value", justify="right")
     final_table.add_row("Total files processed", str(len(media_files)))
     final_table.add_row("EXIF written", str(exif_written_count))
+    final_table.add_row("GPS written (from JSON)", str(gps_written_count))
+    final_table.add_row("Description written (JSON)", str(description_written_count))
     final_table.add_row("Timestamps set", str(timestamps_set_count))
     final_table.add_row("Files copied to output", str(copy_ok))
     final_table.add_row("Exact duplicates deleted", str(exact_dupes))

@@ -206,17 +206,24 @@ def get_timestamp_from_filename(filepath: Path) -> Optional[Tuple[datetime, str]
     return None
 
 
+def _load_json(json_path: Path) -> Optional[dict]:
+    """Read and parse a JSON sidecar. Returns None on any error."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read JSON %s: %s", json_path, e)
+        return None
+
+
 def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
     """Priority 2: Extract timestamp from Google Takeout JSON sidecar.
 
     Returns (datetime, source_label) or None.
     Order: photoTakenTime > creationTime.
     """
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("Failed to read JSON %s: %s", json_path, e)
+    data = _load_json(json_path)
+    if data is None:
         return None
 
     for field, label in [
@@ -233,6 +240,62 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
                 pass
 
     return None
+
+
+def _extract_gps(data: dict) -> Optional[Tuple[float, float, Optional[float]]]:
+    """Extract (lat, lon, altitude) from a Google Takeout JSON dict.
+
+    Prefers ``geoData`` (Google's current stored value) over ``geoDataExif``
+    (what was in the file's EXIF at upload). Skips entries where lat AND lon
+    are both exactly 0 — Google uses (0, 0) as the "no location" sentinel,
+    and no real photo is taken in the Gulf of Guinea. Returns None if neither
+    source has usable coordinates.
+    """
+    for field in ("geoData", "geoDataExif"):
+        geo = data.get(field)
+        if not isinstance(geo, dict):
+            continue
+        try:
+            lat = float(geo.get("latitude", 0) or 0)
+            lon = float(geo.get("longitude", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if lat == 0.0 and lon == 0.0:
+            continue
+        alt_raw = geo.get("altitude")
+        try:
+            alt = float(alt_raw) if alt_raw is not None else None
+        except (TypeError, ValueError):
+            alt = None
+        return lat, lon, alt
+    return None
+
+
+def get_metadata_from_json(json_path: Path) -> dict:
+    """Read all re-uploadable metadata from a Google Takeout JSON.
+
+    Returns a dict with:
+      - ``description``: user-typed caption (str, possibly empty)
+      - ``gps``: (lat, lon, altitude_or_None) tuple, or None if no location
+
+    Fields Google Takeout exports but that CANNOT be re-uploaded via
+    drag-and-drop (albums, favorited flag, archived flag, people tags,
+    imageViews) are intentionally not surfaced here — they'd be dropped
+    by Google Photos on re-ingest regardless.
+    """
+    result: dict = {"description": "", "gps": None}
+    if not json_path:
+        return result
+    data = _load_json(json_path)
+    if data is None:
+        return result
+
+    desc = data.get("description", "")
+    if isinstance(desc, str):
+        result["description"] = desc.strip()
+
+    result["gps"] = _extract_gps(data)
+    return result
 
 
 def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
@@ -331,8 +394,56 @@ def resolve_timestamp(
 # EXIF writing
 # ---------------------------------------------------------------------------
 
-def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
-    """Write EXIF dates to JPEG/PNG/WEBP/TIFF using piexif."""
+def _deg_to_dms_rational(deg: float) -> tuple:
+    """Convert a decimal degree (already absolute value) to DMS rationals.
+
+    Returns ((d, 1), (m, 1), (s_num, 10000)) in the tuple-of-pairs format
+    piexif expects for GPSLatitude / GPSLongitude.
+    """
+    abs_deg = abs(float(deg))
+    d = int(abs_deg)
+    m_float = (abs_deg - d) * 60
+    m = int(m_float)
+    s_float = (m_float - m) * 60
+    s_num = int(round(s_float * 10000))
+    # Carry over if rounding pushed seconds to 60
+    if s_num >= 60 * 10000:
+        s_num = 0
+        m += 1
+        if m >= 60:
+            m = 0
+            d += 1
+    return ((d, 1), (m, 1), (s_num, 10000))
+
+
+def _apply_gps_piexif(exif_dict: dict, gps: Tuple[float, float, Optional[float]]) -> None:
+    """Populate the GPS IFD of a piexif dict in-place from (lat, lon, alt)."""
+    lat, lon, alt = gps
+    gps_ifd = exif_dict.setdefault("GPS", {})
+    gps_ifd[piexif.GPSIFD.GPSVersionID] = (2, 3, 0, 0)
+    gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = (b"N" if lat >= 0 else b"S")
+    gps_ifd[piexif.GPSIFD.GPSLatitude] = _deg_to_dms_rational(lat)
+    gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = (b"E" if lon >= 0 else b"W")
+    gps_ifd[piexif.GPSIFD.GPSLongitude] = _deg_to_dms_rational(lon)
+    if alt is not None:
+        gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
+        # Altitude as rational meters with mm precision
+        alt_num = int(round(abs(alt) * 1000))
+        gps_ifd[piexif.GPSIFD.GPSAltitude] = (alt_num, 1000)
+
+
+def write_exif_piexif(
+    filepath: Path,
+    dt: datetime,
+    description: str = "",
+    gps: Optional[Tuple[float, float, Optional[float]]] = None,
+) -> bool:
+    """Write EXIF dates, optional description, and optional GPS to JPEG/TIFF.
+
+    ``description`` and ``gps`` come from the Google Takeout JSON sidecar.
+    Both are skipped silently when empty/None so we never blank out existing
+    values.
+    """
     ext = filepath.suffix.lower()
     if ext not in EXIF_IMAGE_EXTENSIONS:
         return False
@@ -350,11 +461,23 @@ def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
         logger.debug("Corrupt EXIF in %s, resetting", filepath.name)
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
 
-    try:
-        exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = date_str.encode()
-        exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = date_str.encode()
-        exif_dict["0th"][piexif.ImageIFD.DateTime] = date_str.encode()
+    def _fill(d: dict) -> None:
+        d["Exif"][piexif.ExifIFD.DateTimeOriginal] = date_str.encode()
+        d["Exif"][piexif.ExifIFD.DateTimeDigitized] = date_str.encode()
+        d["0th"][piexif.ImageIFD.DateTime] = date_str.encode()
+        if description:
+            # ImageDescription is ASCII in EXIF; encode with replacement so
+            # umlauts don't raise. XMP/UserComment would preserve unicode,
+            # but piexif can't write XMP and UserComment needs a charset
+            # prefix — ExifTool fallback (below, for non-JPEG) handles both.
+            d["0th"][piexif.ImageIFD.ImageDescription] = description.encode(
+                "ascii", errors="replace"
+            )
+        if gps:
+            _apply_gps_piexif(d, gps)
 
+    try:
+        _fill(exif_dict)
         exif_bytes = piexif.dump(exif_dict)
         piexif.insert(exif_bytes, str(filepath))
         return True
@@ -363,9 +486,7 @@ def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
         logger.debug("EXIF write failed for %s, retrying with fresh dict: %s", filepath.name, e)
         try:
             fresh = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
-            fresh["Exif"][piexif.ExifIFD.DateTimeOriginal] = date_str.encode()
-            fresh["Exif"][piexif.ExifIFD.DateTimeDigitized] = date_str.encode()
-            fresh["0th"][piexif.ImageIFD.DateTime] = date_str.encode()
+            _fill(fresh)
             exif_bytes = piexif.dump(fresh)
             piexif.insert(exif_bytes, str(filepath))
             return True
@@ -374,23 +495,69 @@ def write_exif_piexif(filepath: Path, dt: datetime) -> bool:
             return False
 
 
-def write_exif_exiftool(filepath: Path, dt: datetime) -> bool:
-    """Write EXIF dates to HEIC/video files using ExifTool subprocess."""
+def write_exif_exiftool(
+    filepath: Path,
+    dt: datetime,
+    description: str = "",
+    gps: Optional[Tuple[float, float, Optional[float]]] = None,
+) -> bool:
+    """Write EXIF dates, optional description, and optional GPS via ExifTool.
+
+    Used for HEIC/HEIF, videos (MP4/MOV/AVI/M4V), and as a fallback when
+    piexif fails on exotic EXIF. Unlike piexif this path supports unicode
+    descriptions and quicktime metadata tags.
+    """
     exiftool_path = find_exiftool()
     if not exiftool_path:
         return False
 
     date_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+    ext = filepath.suffix.lower()
+    is_video = ext in VIDEO_EXTENSIONS
+
+    args = [
+        exiftool_path,
+        f"-DateTimeOriginal={date_str}",
+        f"-CreateDate={date_str}",
+        f"-ModifyDate={date_str}",
+    ]
+    if is_video:
+        # QuickTime containers use their own date atoms in addition to EXIF.
+        # -api QuickTimeUTC=1 tells ExifTool to treat the value as UTC.
+        args.extend([
+            f"-TrackCreateDate={date_str}",
+            f"-TrackModifyDate={date_str}",
+            f"-MediaCreateDate={date_str}",
+            f"-MediaModifyDate={date_str}",
+            "-api", "QuickTimeUTC=1",
+        ])
+
+    if description:
+        args.append(f"-ImageDescription={description}")
+        args.append(f"-XMP:Description={description}")
+        if is_video:
+            # QuickTime description atoms
+            args.append(f"-Description={description}")
+
+    if gps:
+        lat, lon, alt = gps
+        args.extend([
+            f"-GPSLatitude={abs(lat)}",
+            f"-GPSLatitudeRef={'N' if lat >= 0 else 'S'}",
+            f"-GPSLongitude={abs(lon)}",
+            f"-GPSLongitudeRef={'E' if lon >= 0 else 'W'}",
+        ])
+        if alt is not None:
+            args.extend([
+                f"-GPSAltitude={abs(alt)}",
+                f"-GPSAltitudeRef={'0' if alt >= 0 else '1'}",
+            ])
+
+    args.extend(["-overwrite_original", str(filepath)])
 
     try:
         result = subprocess.run(
-            [
-                exiftool_path,
-                f"-DateTimeOriginal={date_str}",
-                f"-CreateDate={date_str}",
-                "-overwrite_original",
-                str(filepath),
-            ],
+            args,
             capture_output=True,
             text=True,
             timeout=30,
@@ -432,6 +599,8 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         "exiftool_used": False,
         "date_mismatch": None,
         "json_date": None,
+        "gps_written": False,
+        "description_written": False,
         "status": "ok",
     }
 
@@ -448,31 +617,62 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         if source == "file_mtime":
             result["status"] = "flag_mtime_only"
 
+        # Pull optional GPS + description from the JSON sidecar so we can
+        # write them back into the file's EXIF/XMP. Without this step,
+        # deleting and re-uploading to Google Photos would strip location
+        # and user captions entirely.
+        json_meta = get_metadata_from_json(json_path) if json_path else {
+            "description": "", "gps": None,
+        }
+        description = json_meta.get("description") or ""
+        gps = json_meta.get("gps")
+
         ext = media_path.suffix.lower()
 
         # Write EXIF based on file type.
         #
         # Priority for image formats:
-        #   1. piexif (fast, JPEG/TIFF only)
+        #   1. piexif (fast, JPEG/TIFF only — writes date + GPS + ASCII desc)
         #   2. ExifTool fallback (covers PNG/WebP, plus any JPEG/TIFF
         #      where piexif kapitulates on exotic/corrupt EXIF blocks —
-        #      ExifTool is far more forgiving than piexif).
+        #      ExifTool is far more forgiving than piexif and also writes
+        #      XMP:Description so unicode captions round-trip correctly).
         if ext in EXIF_IMAGE_EXTENSIONS:
-            written = write_exif_piexif(media_path, dt)
+            written = write_exif_piexif(
+                media_path, dt, description=description, gps=gps,
+            )
             result["exif_written"] = written
+            if written:
+                if gps:
+                    result["gps_written"] = True
+                if description:
+                    result["description_written"] = True
             if not written and check_exiftool():
-                written_et = write_exif_exiftool(media_path, dt)
+                written_et = write_exif_exiftool(
+                    media_path, dt, description=description, gps=gps,
+                )
                 if written_et:
                     result["exif_written"] = True
                     result["exiftool_used"] = True
+                    if gps:
+                        result["gps_written"] = True
+                    if description:
+                        result["description_written"] = True
                     logger.debug(
                         "ExifTool fallback succeeded for %s after piexif failed",
                         media_path.name,
                     )
         elif ext in EXIFTOOL_EXTENSIONS:
-            written = write_exif_exiftool(media_path, dt)
+            written = write_exif_exiftool(
+                media_path, dt, description=description, gps=gps,
+            )
             result["exif_written"] = written
             result["exiftool_used"] = written
+            if written:
+                if gps:
+                    result["gps_written"] = True
+                if description:
+                    result["description_written"] = True
             if not written and not check_exiftool():
                 result["status"] = "exiftool_not_found"
 
