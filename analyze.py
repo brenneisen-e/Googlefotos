@@ -182,7 +182,10 @@ def date_from_json(json_path: Path) -> Optional[datetime]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                # JSON timestamp is true UTC epoch; convert to local so the
+                # Excel report shows the same date/time the user sees in
+                # Google Photos (and that the repair tool uses for clusters).
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
                 if _valid(dt):
                     return dt
             except (ValueError, OSError, OverflowError):
@@ -284,7 +287,9 @@ def date_from_video_metadata(filepath: Path) -> Optional[datetime]:
 
 
 def date_from_mtime(filepath: Path) -> datetime:
-    return datetime.fromtimestamp(os.path.getmtime(filepath), tz=timezone.utc)
+    # Local time: matches what the user sees in Windows Explorer / Finder
+    # and is consistent with date_from_json (which also returns local).
+    return datetime.fromtimestamp(os.path.getmtime(filepath), tz=timezone.utc).astimezone()
 
 
 # ---------------------------------------------------------------------------

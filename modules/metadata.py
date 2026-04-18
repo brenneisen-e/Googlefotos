@@ -334,9 +334,14 @@ def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
 
 
 def get_timestamp_from_mtime(filepath: Path) -> Tuple[datetime, str]:
-    """Priority 4 (fallback): use file modification time."""
+    """Priority 4 (fallback): use file modification time, in LOCAL timezone.
+
+    Symmetry with get_timestamp_from_json: both return system-local times
+    so that downstream (cluster folder, new filename, EXIF DateTimeOriginal)
+    behaves identically regardless of timestamp source.
+    """
     mtime = os.path.getmtime(filepath)
-    dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    dt = datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone()
     return dt, "file_mtime"
 
 
