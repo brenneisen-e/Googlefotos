@@ -221,6 +221,17 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
 
     Returns (datetime, source_label) or None.
     Order: photoTakenTime > creationTime.
+
+    The JSON timestamp is a true UTC unix epoch. We immediately convert it
+    to the system's LOCAL timezone, because every downstream consumer wants
+    the local date/time:
+
+      - Google Photos displays photos under their local date — if we used
+        UTC for the cluster folder name, photos taken late evening German
+        time (= early next-day UTC) would land in the WRONG cluster folder
+        and the user wouldn't find them in Google Photos under that date.
+      - EXIF DateTimeOriginal by spec is local time without offset.
+      - The "YYYY-MM-DD_HHMMSS" filename should match what the user sees.
     """
     data = _load_json(json_path)
     if data is None:
@@ -233,7 +244,8 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                dt = dt_utc.astimezone()  # convert to system local tz
                 if _is_valid_timestamp(dt):
                     return dt, label
             except (ValueError, OSError, OverflowError):
