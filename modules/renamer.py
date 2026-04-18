@@ -226,11 +226,15 @@ def rename_all(
 
         ts_str = proc_result.get("timestamp_used")
         if ts_str:
-            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            # timestamp_used is already a local-time string; strptime gives
+            # a naive datetime. We don't tag it because all we do with it
+            # is strftime, which preserves the values verbatim.
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
         else:
-            # Fallback to file mtime
+            # Fallback to file mtime, in LOCAL time (matches what Windows
+            # Explorer / Finder show, and matches our cluster folder naming)
             mtime = os.path.getmtime(media_path)
-            dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            dt = datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone()
 
         new_path, status = copy_and_rename(
             media_path, dt, temp_dir, output_dir,
