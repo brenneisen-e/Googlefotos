@@ -182,10 +182,14 @@ def date_from_json(json_path: Path) -> Optional[datetime]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                # JSON timestamp is true UTC epoch; convert to local so the
-                # Excel report shows the same date/time the user sees in
-                # Google Photos (and that the repair tool uses for clusters).
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
+                # Google's photoTakenTime.timestamp is NOT a true UTC instant
+                # — it's the EXIF DateTimeOriginal local wall-clock treated as
+                # UTC (verifiable from the JSON's own "formatted" field).
+                # Format AS UTC to recover the wall-clock date Google Photos
+                # shows. Calling .astimezone() would add the local UTC offset
+                # and push late-evening photos into the next day's cluster.
+                # See modules/metadata.get_timestamp_from_json for details.
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
                 if _valid(dt):
                     return dt
             except (ValueError, OSError, OverflowError):
