@@ -182,12 +182,11 @@ def date_from_json(json_path: Path) -> Optional[datetime]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                # Google's photoTakenTime.timestamp is NOT a true UTC instant
-                # — it's the EXIF DateTimeOriginal local wall-clock treated as
-                # UTC (verifiable from the JSON's own "formatted" field).
-                # Format AS UTC to recover the wall-clock date Google Photos
-                # shows. Calling .astimezone() would add the local UTC offset
-                # and push late-evening photos into the next day's cluster.
+                # Format AS UTC (no .astimezone()) so Excel shows the same
+                # date the Google Photos website displays. The site shows
+                # the EXIF wall-clock Google encoded into the timestamp;
+                # converting to system local TZ would shift late-evening
+                # photos into the next day.
                 # See modules/metadata.get_timestamp_from_json for details.
                 dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
                 if _valid(dt):

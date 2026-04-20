@@ -222,22 +222,27 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
     Returns (datetime, source_label) or None.
     Order: photoTakenTime > creationTime.
 
-    Important timezone subtlety:
+    Timezone handling — empirically verified against a live Takeout:
 
-    Google Takeout's ``photoTakenTime.timestamp`` is NOT the true UTC instant
-    of capture. Google generates it by taking the camera's EXIF
-    DateTimeOriginal (a naive local wall-clock — EXIF has no timezone field)
-    and treating it AS IF it were UTC. Verifiable from any real Takeout
-    export: a photo named ``IMG_20230815_142536.jpg`` (local 14:25:36) has
-    timestamp ``1692113136`` which the JSON's own ``formatted`` field
-    renders as ``"Aug 15, 2023, 2:25:36 PM UTC"`` — same hour, not shifted.
+    Google builds ``photoTakenTime.timestamp`` by taking the EXIF
+    DateTimeOriginal wall-clock (EXIF has no timezone field per spec)
+    and treating it AS IF it were UTC. Example from a real Takeout:
+    ``IMG_20230815_142536.jpg`` (local 14:25:36) ships with
+    ``formatted: "Aug 15, 2023, 2:25:36 PM UTC"`` — same hour, no offset
+    applied.
 
-    Consequence: to recover the wall-clock date Google Photos displays
-    (and that the user needs for the cluster folder name), we must format
-    the timestamp AS UTC. Calling ``.astimezone()`` to convert to system
-    local time would add the local UTC offset and push late-evening photos
-    into the next day's folder (e.g. CEST/UTC+2: a 22:30 UTC timestamp =
-    "29.07. evening in Google Photos" becomes "30.07. 00:30" on disk).
+    Google Photos' website then displays that timestamp AS-IS (same UTC
+    wall-clock, no viewer-local conversion) — i.e. the site shows the
+    camera's original EXIF date. That means a photo taken 29.07. 23:00
+    CEST (= stored as 29.07. 23:00 UTC) is shown under 29.07. in
+    Google Photos, confirmed by a German user's live comparison.
+
+    For the cluster folder to match Google Photos' display (which is the
+    whole point of the delete-day-and-re-upload workflow) we must keep
+    the UTC wall-clock and NOT call ``.astimezone()``: for a German user
+    the local conversion would push late-evening photos forward one day
+    (29.07. 23:00 UTC → 30.07. 01:00 CEST), breaking the match with
+    what Google Photos displays.
     """
     data = _load_json(json_path)
     if data is None:
