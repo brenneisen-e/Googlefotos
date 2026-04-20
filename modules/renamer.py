@@ -112,11 +112,32 @@ def _resolve_cluster_folder(
 ) -> str:
     """Return the YYYY-MM-DD folder name for cluster-by-json-date mode.
 
-    Prefers the ``json_date`` field already stored in ``proc_result`` by
-    ``metadata.process_file``. Falls back to re-reading the JSON sidecar
-    (useful for resume scenarios where process_file was skipped). If no
-    JSON date can be determined, returns the NO_JSON_DATE_FOLDER sentinel.
+    Priority (empirically matched against the Google Photos Grid View):
+
+      1. ``exif_date`` — EXIF DateTimeOriginal's DATE component. This is
+         the camera-local wall-clock date with no timezone conversion,
+         and matches how Google Photos groups photos under the day header
+         in the Grid View (verified with three live screenshots: a 2003
+         photo with no EXIF TZ, a 2003 photo with EXIF TZ GMT-05:00, and
+         a 2023 WhatsApp photo with EXIF TZ GMT+02:00 all appeared under
+         their EXIF local date regardless of their UTC timestamp).
+
+      2. ``json_date`` — formatted JSON photoTakenTime. Used when a file
+         has no readable EXIF (e.g. videos or stripped metadata). The
+         timezone conversion of this field is best-effort and may be one
+         day off for the narrow class of files whose EXIF was stripped
+         but whose Grid View date Google computes from the timestamp in
+         some opaque TZ. Better than nothing for those.
+
+      3. Re-read JSON as a last-ditch fallback on resume scenarios where
+         process_file wasn't invoked.
+
+      4. NO_JSON_DATE_FOLDER sentinel if absolutely nothing is known.
     """
+    exif_date = proc_result.get("exif_date")
+    if exif_date and len(exif_date) >= 10:
+        return exif_date[:10]
+
     json_date = proc_result.get("json_date")
     if json_date and len(json_date) >= 10:
         return json_date[:10]
