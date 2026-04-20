@@ -19,6 +19,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -33,6 +34,17 @@ from modules.matcher import find_json_for_media
 MEDIA_EXTS = ALL_IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | {
     ".gif", ".bmp", ".raw", ".cr2", ".nef", ".arw", ".dng",
 }
+
+# Kandidaten-TZs — die Anzeige-Zeitzone von Google Photos ist nicht
+# dokumentiert; wir zeigen alle plausiblen Optionen nebeneinander, damit
+# man durch Vergleich mit der Google-Photos-Webseite eindeutig erkennt,
+# welche TZ Google tatsächlich verwendet.
+CANDIDATE_TZS = [
+    ("UTC",         ZoneInfo("UTC")),
+    ("Berlin",      ZoneInfo("Europe/Berlin")),
+    ("Eastern US",  ZoneInfo("America/New_York")),
+    ("Pacific US",  ZoneInfo("America/Los_Angeles")),
+]
 
 
 def _json_fields(json_path: Path) -> dict:

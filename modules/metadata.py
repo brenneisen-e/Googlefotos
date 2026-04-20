@@ -39,14 +39,32 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v", ".mkv", ".wmv", ".flv", ".3g
 # than this many days, log as "date_mismatch".
 MISMATCH_THRESHOLD_DAYS = 30
 
-# Timezone Google Photos' web UI uses to render the date for photos that
-# have no GPS location (lat=0, lon=0 or missing geoData). Verified against
-# a live account: a photoTakenTime of 2023-07-30 00:31:17 UTC (a bulk-upload
-# stamp Google assigns to old sidecar-less WhatsApp imports) is displayed
-# under "Sa., 29. Juli 2023" in Google Photos — i.e. 2023-07-29 17:31 PDT
-# = UTC-7. So Google is rendering server-side in Pacific time, NOT in the
-# viewer's browser timezone. ZoneInfo handles PDT/PST switching across DST.
+# Timezone Google Photos' web UI uses to render date labels. NOT
+# documented by Google and observed to differ by account (likely based
+# on the Google account's region + photo GPS presence). Kalibriert
+# interaktiv über ``analyze_tz.py`` — dessen Ergebnis wird pro Takeout in
+# ``google_tz.txt`` gespeichert und beim CLI-Start via ``--google-tz``
+# an das Tool übergeben.
+#
+# Default: America/Los_Angeles. Das ist die TZ die wir bei einem deutschen
+# Konto mit WhatsApp-Importen ohne GPS empirisch beobachtet haben
+# (timestamp 2023-07-30 00:31 UTC → Anzeige "29. Juli 2023" = 17:31 PDT).
+# Für andere Konten kann eine andere TZ korrekt sein — das entscheidet
+# die Kalibrierung, nicht dieser Default.
 GOOGLE_DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def set_google_display_tz(tz_name: str) -> None:
+    """Erlaubt es, die für den Cluster-Ordner verwendete TZ zur Laufzeit zu
+    setzen — wird von ``repair.py --google-tz`` bzw. aus ``google_tz.txt``
+    aufgerufen, damit die Kalibrierung ohne Code-Änderung wirkt."""
+    global GOOGLE_DISPLAY_TZ
+    try:
+        GOOGLE_DISPLAY_TZ = ZoneInfo(tz_name)
+        logger.info("Google Photos Anzeige-TZ auf '%s' gesetzt.", tz_name)
+    except Exception as e:
+        logger.warning("TZ '%s' konnte nicht geladen werden, bleibe bei %s: %s",
+                       tz_name, GOOGLE_DISPLAY_TZ, e)
 
 # ---------------------------------------------------------------------------
 # Filename date patterns (ordered most-specific first)

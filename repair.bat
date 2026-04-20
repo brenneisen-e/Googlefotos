@@ -90,7 +90,25 @@ if /i "%CONFIRM%"=="j" (
 echo [5/5] Repair-Lauf wird gestartet...
 echo.
 
-python repair.py --skip-extraction --temp temp_analyze --cluster-by-json-date --min-cluster-mismatches 10 --skip-no-json-date
+:: Google-Photos-Anzeige-TZ aus google_tz.txt lesen (wenn vorhanden)
+setlocal enabledelayedexpansion
+set GOOGLE_TZ_ARG=
+if exist "google_tz.txt" (
+    set /p DETECTED_TZ=<google_tz.txt
+    if not "!DETECTED_TZ!"=="" (
+        set GOOGLE_TZ_ARG=--google-tz !DETECTED_TZ!
+        echo       Nutze kalibrierte TZ: !DETECTED_TZ!
+        echo.
+    )
+) else (
+    echo [HINWEIS] google_tz.txt nicht gefunden - Cluster-Ordner
+    echo           koennten am falschen Tag landen. Fuer Sicherheit
+    echo           vor dem Repair einmal analyze_tz.bat ausfuehren.
+    echo.
+)
+
+python repair.py --skip-extraction --temp temp_analyze --cluster-by-json-date --min-cluster-mismatches 10 --skip-no-json-date !GOOGLE_TZ_ARG!
+endlocal
 
 echo.
 echo ============================================
