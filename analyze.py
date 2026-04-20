@@ -20,6 +20,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
+
+# Google Photos web UI renders the date in Pacific time for photos without
+# GPS — see modules/metadata.GOOGLE_DISPLAY_TZ for the live-verified
+# evidence.
+GOOGLE_DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
 
 try:
     from openpyxl import Workbook
@@ -182,13 +188,14 @@ def date_from_json(json_path: Path) -> Optional[datetime]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                # Format AS UTC (no .astimezone()) so Excel shows the same
-                # date the Google Photos website displays. The site shows
-                # the EXIF wall-clock Google encoded into the timestamp;
-                # converting to system local TZ would shift late-evening
-                # photos into the next day.
+                # Convert to Pacific Time — that's the TZ Google Photos'
+                # web UI uses to display the date for photos without GPS
+                # (verified against a live account: a 30.07.2023 00:31 UTC
+                # timestamp shows up as "Sa., 29. Juli 2023" = 29.07. PDT).
                 # See modules/metadata.get_timestamp_from_json for details.
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                dt = datetime.fromtimestamp(
+                    int(ts), tz=timezone.utc,
+                ).astimezone(GOOGLE_DISPLAY_TZ)
                 if _valid(dt):
                     return dt
             except (ValueError, OSError, OverflowError):

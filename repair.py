@@ -106,7 +106,26 @@ def parse_args():
         help="In cluster mode: skip files that have no matched JSON sidecar "
              "instead of dumping them into output/no_json_date/.",
     )
+    parser.add_argument(
+        "--google-tz", default=None, metavar="IANA_TZ",
+        help="IANA-Zeitzone, die Google Photos für die Datumsanzeige "
+             "nutzt (z.B. America/Los_Angeles). Per analyze_tz.py "
+             "ermittelbar. Falls nicht gesetzt: nimmt google_tz.txt, "
+             "sonst America/Los_Angeles als Default.",
+    )
     return parser.parse_args()
+
+
+def resolve_google_tz(cli_arg: str | None) -> str:
+    """CLI-Flag → google_tz.txt → Default (None = Modul-Default)."""
+    if cli_arg:
+        return cli_arg
+    cfg = Path("google_tz.txt")
+    if cfg.is_file():
+        val = cfg.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+    return None
 
 
 def scan_media_files(temp_dir: str) -> list:
@@ -320,6 +339,19 @@ def main():
         ],
     )
     logger = logging.getLogger("repair")
+
+    # Google-Photos-Anzeige-TZ setzen (aus CLI-Flag oder google_tz.txt)
+    resolved_tz = resolve_google_tz(args.google_tz)
+    if resolved_tz:
+        from modules.metadata import set_google_display_tz
+        set_google_display_tz(resolved_tz)
+        logger.info("Google Photos display timezone: %s", resolved_tz)
+    else:
+        logger.info(
+            "Keine Google-TZ konfiguriert — benutze Default "
+            "(America/Los_Angeles). Für sichere Cluster-Ordner bitte "
+            "analyze_tz.bat laufen lassen."
+        )
 
     console.print(Panel(
         "[bold cyan]Google Photos Repair CLI[/bold cyan]\n"

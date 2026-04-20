@@ -23,6 +23,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import piexif
 from PIL import Image
@@ -37,6 +38,33 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v", ".mkv", ".wmv", ".flv", ".3g
 # Cross-validation threshold: if filename and JSON dates differ by more
 # than this many days, log as "date_mismatch".
 MISMATCH_THRESHOLD_DAYS = 30
+
+# Timezone Google Photos' web UI uses to render date labels. NOT
+# documented by Google and observed to differ by account (likely based
+# on the Google account's region + photo GPS presence). Kalibriert
+# interaktiv über ``analyze_tz.py`` — dessen Ergebnis wird pro Takeout in
+# ``google_tz.txt`` gespeichert und beim CLI-Start via ``--google-tz``
+# an das Tool übergeben.
+#
+# Default: America/Los_Angeles. Das ist die TZ die wir bei einem deutschen
+# Konto mit WhatsApp-Importen ohne GPS empirisch beobachtet haben
+# (timestamp 2023-07-30 00:31 UTC → Anzeige "29. Juli 2023" = 17:31 PDT).
+# Für andere Konten kann eine andere TZ korrekt sein — das entscheidet
+# die Kalibrierung, nicht dieser Default.
+GOOGLE_DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def set_google_display_tz(tz_name: str) -> None:
+    """Erlaubt es, die für den Cluster-Ordner verwendete TZ zur Laufzeit zu
+    setzen — wird von ``repair.py --google-tz`` bzw. aus ``google_tz.txt``
+    aufgerufen, damit die Kalibrierung ohne Code-Änderung wirkt."""
+    global GOOGLE_DISPLAY_TZ
+    try:
+        GOOGLE_DISPLAY_TZ = ZoneInfo(tz_name)
+        logger.info("Google Photos Anzeige-TZ auf '%s' gesetzt.", tz_name)
+    except Exception as e:
+        logger.warning("TZ '%s' konnte nicht geladen werden, bleibe bei %s: %s",
+                       tz_name, GOOGLE_DISPLAY_TZ, e)
 
 # ---------------------------------------------------------------------------
 # Filename date patterns (ordered most-specific first)
@@ -224,25 +252,22 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
 
     Timezone handling — empirically verified against a live Takeout:
 
-    Google builds ``photoTakenTime.timestamp`` by taking the EXIF
-    DateTimeOriginal wall-clock (EXIF has no timezone field per spec)
-    and treating it AS IF it were UTC. Example from a real Takeout:
-    ``IMG_20230815_142536.jpg`` (local 14:25:36) ships with
-    ``formatted: "Aug 15, 2023, 2:25:36 PM UTC"`` — same hour, no offset
-    applied.
+    The cluster folder must match the date Google Photos shows on its
+    website (delete-day-and-re-upload workflow). For photos WITHOUT a
+    real GPS fix (Google's sentinel is ``geoData = {lat: 0, lon: 0}``),
+    Google renders the date server-side in **Pacific Time**, not in the
+    viewer's browser timezone.
 
-    Google Photos' website then displays that timestamp AS-IS (same UTC
-    wall-clock, no viewer-local conversion) — i.e. the site shows the
-    camera's original EXIF date. That means a photo taken 29.07. 23:00
-    CEST (= stored as 29.07. 23:00 UTC) is shown under 29.07. in
-    Google Photos, confirmed by a German user's live comparison.
+    Concrete live example from a user in Germany (CEST):
+      photoTakenTime.timestamp : 1690677077
+      photoTakenTime.formatted : "30.07.2023, 00:31:17 UTC"
+      Google Photos web UI     : "Sa., 29. Juli 2023"
+      → 2023-07-29 17:31 PDT (UTC-7), i.e. America/Los_Angeles.
 
-    For the cluster folder to match Google Photos' display (which is the
-    whole point of the delete-day-and-re-upload workflow) we must keep
-    the UTC wall-clock and NOT call ``.astimezone()``: for a German user
-    the local conversion would push late-evening photos forward one day
-    (29.07. 23:00 UTC → 30.07. 01:00 CEST), breaking the match with
-    what Google Photos displays.
+    So we convert the UTC timestamp via ``astimezone(GOOGLE_DISPLAY_TZ)``
+    (= America/Los_Angeles, with ZoneInfo handling PDT/PST switching).
+    Converting to system local time would have given 30.07. for this
+    user and broken the match with the website.
     """
     data = _load_json(json_path)
     if data is None:
@@ -255,7 +280,9 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                dt = datetime.fromtimestamp(
+                    int(ts), tz=timezone.utc,
+                ).astimezone(GOOGLE_DISPLAY_TZ)
                 if _is_valid_timestamp(dt):
                     return dt, label
             except (ValueError, OSError, OverflowError):
