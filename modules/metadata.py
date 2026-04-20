@@ -653,6 +653,7 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         "exiftool_used": False,
         "date_mismatch": None,
         "json_date": None,
+        "exif_date": None,
         "gps_written": False,
         "description_written": False,
         "status": "ok",
@@ -666,6 +667,14 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
         result["json_date"] = (
             json_dt.strftime("%Y-%m-%d %H:%M:%S") if json_dt else None
         )
+
+        # EXIF DateTimeOriginal is the photo's LOCAL wall-clock (camera TZ).
+        # Google Photos' Grid View groups photos by this local date, so it's
+        # the correct cluster-folder key — regardless of JSON-timestamp TZ
+        # mess. Falls back to None when no EXIF (videos, stripped metadata).
+        exif_res = get_timestamp_from_exif(media_path)
+        if exif_res:
+            result["exif_date"] = exif_res[0].strftime("%Y-%m-%d %H:%M:%S")
 
         # Flag file_mtime as low-confidence
         if source == "file_mtime":
