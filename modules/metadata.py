@@ -222,16 +222,22 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
     Returns (datetime, source_label) or None.
     Order: photoTakenTime > creationTime.
 
-    The JSON timestamp is a true UTC unix epoch. We immediately convert it
-    to the system's LOCAL timezone, because every downstream consumer wants
-    the local date/time:
+    Important timezone subtlety:
 
-      - Google Photos displays photos under their local date — if we used
-        UTC for the cluster folder name, photos taken late evening German
-        time (= early next-day UTC) would land in the WRONG cluster folder
-        and the user wouldn't find them in Google Photos under that date.
-      - EXIF DateTimeOriginal by spec is local time without offset.
-      - The "YYYY-MM-DD_HHMMSS" filename should match what the user sees.
+    Google Takeout's ``photoTakenTime.timestamp`` is NOT the true UTC instant
+    of capture. Google generates it by taking the camera's EXIF
+    DateTimeOriginal (a naive local wall-clock — EXIF has no timezone field)
+    and treating it AS IF it were UTC. Verifiable from any real Takeout
+    export: a photo named ``IMG_20230815_142536.jpg`` (local 14:25:36) has
+    timestamp ``1692113136`` which the JSON's own ``formatted`` field
+    renders as ``"Aug 15, 2023, 2:25:36 PM UTC"`` — same hour, not shifted.
+
+    Consequence: to recover the wall-clock date Google Photos displays
+    (and that the user needs for the cluster folder name), we must format
+    the timestamp AS UTC. Calling ``.astimezone()`` to convert to system
+    local time would add the local UTC offset and push late-evening photos
+    into the next day's folder (e.g. CEST/UTC+2: a 22:30 UTC timestamp =
+    "29.07. evening in Google Photos" becomes "30.07. 00:30" on disk).
     """
     data = _load_json(json_path)
     if data is None:
@@ -244,8 +250,7 @@ def get_timestamp_from_json(json_path: Path) -> Optional[Tuple[datetime, str]]:
         ts = data.get(field, {}).get("timestamp")
         if ts:
             try:
-                dt_utc = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-                dt = dt_utc.astimezone()  # convert to system local tz
+                dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
                 if _is_valid_timestamp(dt):
                     return dt, label
             except (ValueError, OSError, OverflowError):
