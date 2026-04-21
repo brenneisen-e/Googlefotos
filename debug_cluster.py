@@ -6,11 +6,16 @@ Benutzung:
     python debug_cluster.py --temp ./temp --date 2023-07-30
     python debug_cluster.py --temp ./temp --date 2023-07-30 --out debug.txt
 
-Findet alle Mediendateien im --temp-Ordner, deren Cluster-Tag (JSON-Datum)
-oder Dateiname-Datum oder EXIF-Datum am angegebenen Tag liegt, und
-schreibt pro Datei EINE Block mit allen Zeitquellen nebeneinander, damit
-man die Diskrepanz zwischen Google-Photos-Anzeige und Tool-Cluster sehen
-kann.
+Findet alle Mediendateien im --temp-Ordner, deren EXIF-Datum,
+Dateiname-Datum oder JSON-Timestamp am angegebenen Tag liegt, und
+schreibt pro Datei einen Block mit allen Zeitquellen nebeneinander —
+Dateiname-Parse, EXIF DateTimeOriginal, mtime, JSON photoTakenTime
+(sowohl UTC-formatiert als auch in System-Local-TZ umgerechnet).
+
+Repair.py's Cluster-Regel ist EXIF > Dateiname > JSON. Dieser Dump
+zeigt alle drei, damit man sofort sieht warum eine Datei im
+angezeigten Ordner landet (oder nicht) — und bei Abweichung vom
+Google-Photos-Grid eindeutig den Ursprungsfall erkennt.
 """
 
 import argparse
@@ -235,14 +240,17 @@ def main():
         f"System-Zeitzone       : {datetime.now().astimezone().tzinfo}",
         f"Anzahl Dateien im Dump: {len(matches)}",
         "",
-        "Interpretation-Hinweise:",
-        "  - 'timestamp AS UTC'              = so stellt unser aktueller",
-        "     Fix den Cluster-Ordner auf Disk.",
-        "  - 'timestamp converted to local'  = frühere (falsche) Logik mit",
-        "     .astimezone(); zum Vergleich mit dabei.",
-        "  - 'photoTakenTime.formatted'      = der Roh-UTC-Text im JSON.",
-        "  - 'EXIF DateTimeOrig'             = was die Kamera im Bild",
-        "     gespeichert hat (EXIF hat keine Zeitzonen-Angabe).",
+        "Interpretation-Hinweise (Cluster-Priorität in repair.py):",
+        "  1. 'EXIF DateTimeOrig' - bevorzugt, wenn lesbar. Das ist",
+        "      das lokale Aufnahmedatum der Kamera; Google Photos",
+        "      Grid-View nutzt exakt diesen Wert.",
+        "  2. 'Datum Dateiname'   - Fallback bei gestripptem EXIF",
+        "      (z.B. bestimmte Screenshots/Webdownloads).",
+        "  3. 'timestamp converted to local' - letzter Fallback; die",
+        "      hier angezeigte TZ kommt aus google_tz.txt (bei",
+        "      fehlendem Config-File: America/Los_Angeles).",
+        "  'timestamp AS UTC' ist nur zum Vergleich mit abgebildet -",
+        "      wird NICHT mehr direkt als Cluster-Datum benutzt.",
         "",
     ]
 

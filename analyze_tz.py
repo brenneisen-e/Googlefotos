@@ -2,9 +2,19 @@
 """
 TZ-Kalibrierung für Google Photos.
 
-Google Photos zeigt für Fotos ohne GPS je nach Konto in einer Server-TZ an
-(Pacific / Eastern / UTC / Europe - nicht dokumentiert). Für 130k Dateien
-muss diese TZ bombensicher stimmen, sonst landen Cluster am falschen Tag.
+IN DEN MEISTEN FÄLLEN NICHT MEHR NÖTIG.
+----------------------------------------
+Seit Version 6185765 clustert das Repair-Tool primär nach EXIF
+DateTimeOriginal, nicht nach der JSON-Timestamp-Umrechnung. EXIF
+enthält bereits das lokale Aufnahmedatum, das Google Photos in der
+Grid-View anzeigt — eine TZ-Kalibrierung ändert daran nichts.
+
+Dieses Script ist nur noch relevant wenn viele deiner Dateien
+**überhaupt kein EXIF** haben (ältere Scans, bestimmte Videos, sehr
+alte Formate). Für solche Dateien fällt repair.py auf den
+JSON-photoTakenTime in der hier kalibrierten TZ zurück. Falls deine
+EXIF-reichen Fotos schon korrekt geclustert werden, brauchst du diese
+Kalibrierung nicht.
 
 Workflow:
   1. python analyze_tz.py --temp ./temp_analyze
