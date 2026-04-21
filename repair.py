@@ -679,7 +679,10 @@ def main():
     copy_skip = sum(1 for r in rename_results if r["status"] == "skipped_resume")
     skip_small = sum(1 for r in rename_results if r["status"] == "skipped_small_cluster")
     skip_nojson = sum(1 for r in rename_results if r["status"] == "skipped_no_json_date")
-    copy_fail = len(rename_results) - copy_ok - copy_skip - skip_small - skip_nojson
+    skip_dup_content = sum(1 for r in rename_results if r["status"] == "skipped_duplicate_content")
+    skip_dup_name = sum(1 for r in rename_results if r["status"] == "skipped_duplicate_name")
+    copy_fail = (len(rename_results) - copy_ok - copy_skip - skip_small
+                 - skip_nojson - skip_dup_content - skip_dup_name)
 
     phase4_stats = {"files_copied": copy_ok, "copy_failures": copy_fail}
     if copy_skip:
@@ -688,6 +691,10 @@ def main():
         phase4_stats["skipped_small_cluster"] = skip_small
     if skip_nojson:
         phase4_stats["skipped_no_json_date"] = skip_nojson
+    if skip_dup_content:
+        phase4_stats["skipped_byte_duplicate"] = skip_dup_content
+    if skip_dup_name:
+        phase4_stats["skipped_album_duplicate"] = skip_dup_name
     print_phase_stats(phase4_stats)
 
     # ------------------------------------------------------------------

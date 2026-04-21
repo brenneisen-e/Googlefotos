@@ -163,6 +163,7 @@ def copy_and_rename(
     temp_dir: str,
     output_dir: str,
     cluster_folder: Optional[str] = None,
+    skip_if_exists: bool = False,
 ) -> Tuple[Optional[Path], str]:
     """Copy a media file to output with the new name.
 
@@ -172,6 +173,15 @@ def copy_and_rename(
     ``--cluster-by-json-date`` mode so every file that Google Photos
     currently stamps with the same date ends up in the same folder,
     ready for a delete+re-upload round-trip.
+
+    ``skip_if_exists``: when True, if a file with the EXACT same output
+    filename already exists in the destination, skip this copy and return
+    ("skipped_duplicate_name"). Used in cluster mode to collapse Google
+    Takeout's year-folder + album-folder duplicates — identical filename
+    at the identical capture timestamp is always the same logical photo,
+    even if Google re-encoded the album copy so byte-MD5s diverge. When
+    False (legacy, non-cluster mode) the old `_2`/`_3` suffix collision
+    resolver keeps both files so nothing gets lost.
 
     Returns (new_path, status_string).
     """
@@ -186,7 +196,14 @@ def copy_and_rename(
         dest_dir = Path(output_dir) / subfolder
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        dest_path = resolve_collision(dest_dir / new_name)
+        raw_dest = dest_dir / new_name
+        if skip_if_exists and raw_dest.exists():
+            logger.debug(
+                "Skip Takeout-duplicate (same output name already copied): %s",
+                media_path,
+            )
+            return None, "skipped_duplicate_name"
+        dest_path = resolve_collision(raw_dest)
 
         shutil.copy2(str(media_path), str(dest_path))
 
@@ -397,6 +414,13 @@ def rename_all(
         new_path, status = copy_and_rename(
             media_path, dt, temp_dir, output_dir,
             cluster_folder=cluster_folder,
+            # In cluster mode, skip Takeout year-folder + album-folder
+            # duplicates that would otherwise collide on the same output
+            # name. Pre-copy MD5 dedup already handles byte-identical
+            # copies; this catches Google's per-album re-encodes too,
+            # because a collision on the output filename implies same
+            # capture time + same original filename = same logical photo.
+            skip_if_exists=bool(cluster_by_json_date),
         )
 
         rename_results.append({
