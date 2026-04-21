@@ -633,6 +633,7 @@ def main():
                 cluster_by_json_date=args.cluster_by_json_date,
                 min_cluster_mismatches=args.min_cluster_mismatches,
                 skip_no_json_date=args.skip_no_json_date,
+                dedupe_by_content=args.cluster_by_json_date,
                 progress_callback=_advance,
             )
 
@@ -665,6 +666,7 @@ def main():
                 cluster_by_json_date=args.cluster_by_json_date,
                 min_cluster_mismatches=args.min_cluster_mismatches,
                 skip_no_json_date=args.skip_no_json_date,
+                dedupe_by_content=args.cluster_by_json_date,
                 progress_callback=_advance,
             )
         if resume_conn:
