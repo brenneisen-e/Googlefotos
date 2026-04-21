@@ -1,12 +1,14 @@
 """File renaming and copying module."""
 
+import hashlib
 import logging
 import os
 import re
 import shutil
 from datetime import datetime, timezone
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from modules.metadata import get_timestamp_from_json
 
@@ -19,6 +21,15 @@ NO_JSON_DATE_FOLDER = "no_json_date"
 # Characters illegal in filenames across common filesystems
 ILLEGAL_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
+# Detects an already-applied "YYYY-MM-DD_HHMMSS_" prefix so we don't
+# stack a second one on top when Google Takeout hands us a file that
+# some earlier tool (or an album-folder export) already prefixed.
+# Without this, a file named "2012-09-02_105509_SC20120902-105509.jpg"
+# becomes "2012-09-02_105509_2012-09-02_105509_SC20120902-105509.jpg".
+EXISTING_DATE_PREFIX_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_\d{6}_"
+)
+
 
 def sanitize_filename(name: str) -> str:
     """Remove illegal filesystem characters from a filename."""
@@ -26,11 +37,97 @@ def sanitize_filename(name: str) -> str:
 
 
 def build_new_filename(original_path: Path, dt: datetime) -> str:
-    """Build new filename: YYYY-MM-DD_HHMMSS_originalfilename.ext"""
+    """Build new filename: YYYY-MM-DD_HHMMSS_originalfilename.ext
+
+    If the original filename is already prefixed with a YYYY-MM-DD_HHMMSS_
+    pattern (happens when Google Takeout's album folders contain
+    pre-prefixed copies, or when the tool is re-run over its own output),
+    the existing prefix is stripped first so we don't stack two prefixes.
+    """
     prefix = dt.strftime("%Y-%m-%d_%H%M%S")
     stem = sanitize_filename(original_path.stem)
+    stem = EXISTING_DATE_PREFIX_RE.sub("", stem, count=1)
     ext = original_path.suffix.lower()
     return f"{prefix}_{stem}{ext}"
+
+
+# ---------------------------------------------------------------------------
+# Content-hash dedup (pre-copy, so each unique photo lands in the cluster
+# folder exactly once regardless of how many Takeout subfolders it lived in)
+# ---------------------------------------------------------------------------
+
+def _md5_file(path_str: str) -> Tuple[str, Optional[str]]:
+    """Return (path, md5_hex) for a given file path; md5 is None on error."""
+    try:
+        h = hashlib.md5()
+        with open(path_str, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return path_str, h.hexdigest()
+    except OSError:
+        return path_str, None
+
+
+def deduplicate_by_content(
+    matched_files: List[Tuple[Path, Optional[Path]]],
+    process_results: List[dict],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[List[Tuple[Path, Optional[Path]]], List[dict], int]:
+    """Collapse byte-identical input files down to one representative each.
+
+    Google Takeout stores every photo in both its year-folder (``Fotos von
+    2012/…``) AND in every album it belongs to (``Hochzeit 2012/…``). A file
+    in two albums is therefore present three times. If we copy all of them
+    to the cluster output folder, the user gets 2-5x the expected file count
+    per day — which is exactly the "70 Dateien statt 35" symptom.
+
+    Running the duplicate-detection phase AFTER copying would usually clean
+    this up, but only if the pre-copy processing step writes byte-identical
+    EXIF to every copy. In practice the original files can differ slightly
+    (different orientation tag, different JFIF header bytes from Google's
+    per-album re-encode, etc.), so post-copy MD5 dedup misses them even
+    though they are perceptually the same photo.
+
+    This pass hashes every matched input file in parallel and keeps only
+    one entry per MD5. The survivor is the first occurrence, so album
+    duplicates collapse into their year-folder original. Returned tuple:
+    (deduped matched_files, aligned process_results, duplicates_dropped).
+    """
+    if not matched_files:
+        return matched_files, process_results, 0
+
+    paths = [str(mf[0]) for mf in matched_files]
+    n_procs = max(1, min(cpu_count(), 8))
+    hashes: dict = {}  # path -> md5
+    completed = 0
+    with Pool(processes=n_procs) as pool:
+        for path_str, md5 in pool.imap_unordered(_md5_file, paths, chunksize=32):
+            hashes[path_str] = md5
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(paths))
+
+    seen: set = set()
+    kept_files: List[Tuple[Path, Optional[Path]]] = []
+    kept_results: List[dict] = []
+    dropped = 0
+    for (mp, jp), pr in zip(matched_files, process_results):
+        md5 = hashes.get(str(mp))
+        if md5 is None:
+            # Hash failed (unreadable file); let it through, will fail later
+            # in the copy phase with a clean error rather than being
+            # silently dropped here.
+            kept_files.append((mp, jp))
+            kept_results.append(pr)
+            continue
+        if md5 in seen:
+            dropped += 1
+            continue
+        seen.add(md5)
+        kept_files.append((mp, jp))
+        kept_results.append(pr)
+
+    return kept_files, kept_results, dropped
 
 
 def resolve_collision(dest_path: Path) -> Path:
@@ -172,9 +269,17 @@ def rename_all(
     cluster_by_json_date: bool = False,
     min_cluster_mismatches: int = 0,
     skip_no_json_date: bool = False,
+    dedupe_by_content: bool = False,
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> list:
     """Rename and copy all files to output directory.
+
+    ``dedupe_by_content``: if True, collapse byte-identical input files
+    down to a single entry via MD5 before copying — prevents Google
+    Takeout's year-folder + album-folder duplicates from both landing in
+    the cluster output. Only the first occurrence survives. Significantly
+    cuts output size on libraries where most photos are in at least one
+    album.
 
     matched_files: list of (media_path, json_path_or_None)
     process_results: list of dicts from metadata.process_file()
@@ -201,6 +306,29 @@ def rename_all(
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     rename_results = []
+
+    # Collapse year-folder + album-folder copies of the same photo before
+    # anything else. Each collapsed duplicate is emitted as a completed
+    # rename_result with status "skipped_duplicate_content" so the caller's
+    # progress bar advances correctly and the CSV reports the skip reason.
+    if dedupe_by_content and matched_files:
+        original_count = len(matched_files)
+        matched_files, process_results, dropped = deduplicate_by_content(
+            matched_files, process_results,
+        )
+        if dropped:
+            logger.info(
+                "Content-dedup: %d duplicate input files collapsed into "
+                "%d unique (%.1f%% reduction).",
+                dropped, len(matched_files),
+                100.0 * dropped / max(original_count, 1),
+            )
+        # Advance progress bar for the dropped files so the UI's total
+        # stays in sync with the caller's expectation (which was sized
+        # against the pre-dedup matched_files length).
+        if progress_callback and dropped:
+            for _ in range(dropped):
+                progress_callback("(dedup)", "skipped_duplicate_content")
 
     # Pre-compute per-day mismatch counts when cluster filtering is active.
     # We only need this if the caller asked for a size threshold.
