@@ -1,10 +1,25 @@
 """EXIF writing and timestamp repair module.
 
-Timestamp priority (filename-first):
-  1. Parse from filename (highest trust – set by device at capture time)
+There are TWO separate date concepts in this tool; don't conflate them:
+
+---- "Write timestamp" (this module, resolve_timestamp) ----
+Determines what gets written into EXIF DateTimeOriginal on the OUTPUT
+file and prefixed to the new filename. Priority:
+  1. Filename (highest trust – set by device at capture time)
   2. Google JSON photoTakenTime / creationTime
   3. Existing EXIF DateTimeOriginal
   4. File modification time → marked as FLAG
+Filename wins because it typically survives re-uploads, re-ingests and
+Google-side stripping better than any in-file tag.
+
+---- "Grid-view date" (modules/renamer._resolve_cluster_folder) ----
+Determines the cluster-folder name, which MUST match the day header
+Google Photos shows in the Grid View (delete-day-and-re-upload). Priority:
+  1. EXIF DateTimeOriginal (Google reads EXIF first for Grid)
+  2. Filename date
+  3. JSON photoTakenTime in the configured TZ (google_tz.txt)
+Different priority because we're mirroring Google's display logic, not
+reconstructing the capture event.
 
 Cross-validation:
   If filename-date AND json-date both exist and delta > 30 days,
@@ -347,25 +362,147 @@ def get_metadata_from_json(json_path: Path) -> dict:
     return result
 
 
-def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
-    """Priority 3: Read existing EXIF DateTimeOriginal from the file."""
-    ext = filepath.suffix.lower()
-    if ext not in (".jpg", ".jpeg", ".tiff", ".tif"):
-        return None
+def _parse_exif_date_string(s: str) -> Optional[datetime]:
+    """Tolerant EXIF/ExifTool date parser.
 
+    EXIF stores dates in local wall-clock (no timezone) as "YYYY:MM:DD HH:MM:SS".
+    ExifTool for videos sometimes returns "YYYY:MM:DD HH:MM:SS+HH:MM" (with
+    offset) — we strip the offset so the returned datetime's DATE component
+    still represents the LOCAL wall-clock date, which is what Google Photos'
+    Grid View groups by.
+    """
+    if not s:
+        return None
+    s = s.strip().rstrip("\x00")
+    if not s or s.startswith("0000:00:00"):
+        return None
+    # Strip a trailing timezone offset like "+02:00", "-05:00", "+0200" or "Z"
+    # — we only care about the LOCAL wall-clock portion for Grid-view matching.
+    s = re.sub(r"[Zz]$", "", s)
+    s = re.sub(r"[+\-]\d{2}:?\d{2}$", "", s)
+    s = s.strip()
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%Y:%m:%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                "%Y:%m:%d", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            if _is_valid_timestamp(dt):
+                return dt
+        except ValueError:
+            continue
+    return None
+
+
+def _exif_date_via_piexif(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via piexif (fast, JPEG/TIFF only)."""
     try:
         exif_dict = piexif.load(str(filepath))
-        raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+    except Exception:
+        return None
+    for tag in (piexif.ExifIFD.DateTimeOriginal,
+                piexif.ExifIFD.DateTimeDigitized):
+        raw = exif_dict.get("Exif", {}).get(tag)
         if raw:
-            date_str = raw.decode("utf-8", errors="ignore").strip()
-            if date_str and date_str != "0000:00:00 00:00:00":
-                dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
-                if _is_valid_timestamp(dt):
-                    return dt, "exif_original"
+            dt = _parse_exif_date_string(raw.decode("utf-8", errors="ignore"))
+            if dt:
+                return dt
+    raw = exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
+    if raw:
+        dt = _parse_exif_date_string(raw.decode("utf-8", errors="ignore"))
+        if dt:
+            return dt
+    return None
+
+
+def _exif_date_via_pillow(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via Pillow (broader format support than piexif)."""
+    try:
+        with Image.open(filepath) as img:
+            exif_data = img.getexif()
+            if not exif_data:
+                return None
+            # 36867 = DateTimeOriginal, 36868 = DateTimeDigitized, 306 = DateTime
+            for tag_id in (36867, 36868, 306):
+                val = exif_data.get(tag_id)
+                if val and isinstance(val, str):
+                    dt = _parse_exif_date_string(val)
+                    if dt:
+                        return dt
     except Exception:
         pass
+    return None
+
+
+def _exif_date_via_exiftool(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via ExifTool — covers HEIC, videos, PNGs with
+    non-standard EXIF, and files where piexif/Pillow give up.
+
+    ExifTool tag priority mirrors what Google Photos itself reads:
+      DateTimeOriginal > CreateDate > MediaCreateDate > TrackCreateDate.
+    Videos (QuickTime) only have the last three. PNG/HEIC typically have
+    DateTimeOriginal via XMP or a sidecar block.
+    """
+    exiftool_path = find_exiftool()
+    if not exiftool_path:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                exiftool_path,
+                "-s", "-s", "-s",  # terse output: values only
+                "-DateTimeOriginal",
+                "-CreateDate",
+                "-MediaCreateDate",
+                "-TrackCreateDate",
+                "-api", "QuickTimeUTC=0",  # keep native (local) time for QT
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        dt = _parse_exif_date_string(line.strip())
+        if dt:
+            return dt
+    return None
+
+
+def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
+    """Read the photo's LOCAL wall-clock date/time from embedded metadata.
+
+    Covers JPG/TIFF (piexif, fast path), PNG/WebP/GIF (Pillow), and
+    HEIC/HEIF/videos (ExifTool). Returns a UTC-tagged datetime whose DATE
+    and TIME components represent the naive local wall-clock from the
+    file — i.e. what Google Photos displays in the Grid View day header.
+    The UTC tag is a technical artifact; we never interpret the value as
+    an actual UTC instant.
+    """
+    ext = filepath.suffix.lower()
+
+    # Tier 1: piexif for JPEG/TIFF (fastest)
+    if ext in (".jpg", ".jpeg", ".tiff", ".tif"):
+        dt = _exif_date_via_piexif(filepath)
+        if dt:
+            return dt, "exif_original"
+
+    # Tier 2: Pillow — broader format coverage (PNG, WebP, GIF, some TIFFs)
+    if ext in (".jpg", ".jpeg", ".tiff", ".tif",
+               ".png", ".webp", ".gif", ".bmp"):
+        dt = _exif_date_via_pillow(filepath)
+        if dt:
+            return dt, "exif_original"
+
+    # Tier 3: ExifTool — HEIC/HEIF (XMP), videos (QuickTime), and the
+    # long tail of formats the above can't handle.
+    if ext in (".heic", ".heif", ".mp4", ".mov", ".avi", ".m4v",
+               ".mkv", ".wmv", ".flv", ".3gp",
+               ".png", ".webp", ".gif", ".jpg", ".jpeg"):
+        dt = _exif_date_via_exiftool(filepath)
+        if dt:
+            return dt, "exif_original"
 
     return None
 
@@ -389,24 +526,41 @@ def get_timestamp_from_mtime(filepath: Path) -> Tuple[datetime, str]:
 def resolve_timestamp(
     media_path: Path,
     json_path: Optional[Path],
-) -> Tuple[datetime, str, Optional[str], Optional[datetime]]:
+) -> Tuple[datetime, str, Optional[str], Optional[datetime], Optional[datetime]]:
     """Resolve the best timestamp for a media file.
 
-    NEW PRIORITY:
-      1. Filename (highest trust – set by device at capture time)
-      2. Google JSON photoTakenTime / creationTime
-      3. Existing EXIF DateTimeOriginal
-      4. File modification time (flagged)
+    Two parallel date concepts are computed here, because the tool
+    uses them for DIFFERENT purposes and they must not be conflated:
 
-    Returns (datetime, source_label, mismatch_info_or_None, json_dt_or_None).
-    mismatch_info is set when filename and JSON dates differ by >30 days.
-    json_dt is the JSON photoTakenTime datetime (even when it did not win),
-    so callers can cluster files by the date Google currently shows.
+      * The "write timestamp" (first 3 return values) — what gets
+        written into EXIF DateTimeOriginal of the output file and
+        stamped as the new filename prefix. Prioritises:
+          1. Filename (highest trust – set by device at capture time)
+          2. Google JSON photoTakenTime / creationTime
+          3. Existing EXIF DateTimeOriginal
+          4. File modification time (flagged)
+        Filename wins because it typically reflects the real capture
+        moment even when EXIF got overwritten by Google's re-ingest.
+
+      * The "Google Grid date" (last 2 return values: json_dt, exif_dt)
+        — used by modules/renamer._resolve_cluster_folder to pick the
+        folder name, which must match what Google Photos displays in
+        its Grid View day header (for the delete-day-and-re-upload
+        workflow). That rule is EXIF-first, because Google reads
+        EXIF:DateTimeOriginal for the Grid view and does NOT consult
+        the filename. See the docstring on _resolve_cluster_folder.
+
+    Returns (write_dt, source_label, mismatch_info, json_dt, exif_dt).
+    exif_dt is surfaced separately so process_file doesn't have to
+    re-read EXIF (which for HEIC/videos would mean a second ExifTool
+    subprocess — ~2x slower on a 130k-file run).
     """
     filename_result = get_timestamp_from_filename(media_path)
     json_result = get_timestamp_from_json(json_path) if json_path else None
+    exif_result = get_timestamp_from_exif(media_path)
     mismatch_info = None
     json_dt = json_result[0] if json_result else None
+    exif_dt = exif_result[0] if exif_result else None
 
     # Cross-validation: check if filename and JSON dates diverge
     if filename_result and json_result:
@@ -428,20 +582,22 @@ def resolve_timestamp(
 
     # Priority 1: Filename
     if filename_result:
-        return filename_result[0], filename_result[1], mismatch_info, json_dt
+        return (filename_result[0], filename_result[1],
+                mismatch_info, json_dt, exif_dt)
 
     # Priority 2: JSON
     if json_result:
-        return json_result[0], json_result[1], mismatch_info, json_dt
+        return (json_result[0], json_result[1],
+                mismatch_info, json_dt, exif_dt)
 
-    # Priority 3: Existing EXIF
-    exif_result = get_timestamp_from_exif(media_path)
+    # Priority 3: Existing EXIF (already read above)
     if exif_result:
-        return exif_result[0], exif_result[1], mismatch_info, json_dt
+        return (exif_result[0], exif_result[1],
+                mismatch_info, json_dt, exif_dt)
 
     # Priority 4: File mtime (flagged)
     mtime_dt, mtime_source = get_timestamp_from_mtime(media_path)
-    return mtime_dt, mtime_source, mismatch_info, json_dt
+    return mtime_dt, mtime_source, mismatch_info, json_dt, exif_dt
 
 
 # ---------------------------------------------------------------------------
@@ -660,21 +816,23 @@ def process_file(media_path: Path, json_path: Optional[Path]) -> dict:
     }
 
     try:
-        dt, source, mismatch, json_dt = resolve_timestamp(media_path, json_path)
+        dt, source, mismatch, json_dt, exif_dt = resolve_timestamp(
+            media_path, json_path,
+        )
         result["timestamp_used"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         result["timestamp_source"] = source
         result["date_mismatch"] = mismatch
         result["json_date"] = (
             json_dt.strftime("%Y-%m-%d %H:%M:%S") if json_dt else None
         )
-
-        # EXIF DateTimeOriginal is the photo's LOCAL wall-clock (camera TZ).
-        # Google Photos' Grid View groups photos by this local date, so it's
-        # the correct cluster-folder key — regardless of JSON-timestamp TZ
-        # mess. Falls back to None when no EXIF (videos, stripped metadata).
-        exif_res = get_timestamp_from_exif(media_path)
-        if exif_res:
-            result["exif_date"] = exif_res[0].strftime("%Y-%m-%d %H:%M:%S")
+        # EXIF DateTimeOriginal already read inside resolve_timestamp — reuse
+        # it here (avoids a second round-trip through ExifTool/Pillow, which
+        # would double the EXIF-read cost on a 130k-file run, particularly
+        # painful for HEIC and video files). This is what the renamer's
+        # _resolve_cluster_folder prefers over json_date for the output
+        # folder name.
+        if exif_dt:
+            result["exif_date"] = exif_dt.strftime("%Y-%m-%d %H:%M:%S")
 
         # Flag file_mtime as low-confidence
         if source == "file_mtime":

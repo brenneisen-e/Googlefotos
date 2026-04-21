@@ -22,10 +22,23 @@ from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-# Google Photos web UI renders the date in Pacific time for photos without
-# GPS — see modules/metadata.GOOGLE_DISPLAY_TZ for the live-verified
-# evidence.
-GOOGLE_DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+# Timezone used only when a photo has NO readable EXIF DateTimeOriginal
+# (stripped EXIF, or container formats we can't read here). For files with
+# EXIF we use the EXIF local date directly — that's what Google Photos
+# shows in the Grid View. Reads google_tz.txt if present (same calibration
+# file repair.py uses), so analyze.py and repair.py stay consistent.
+def _load_display_tz() -> ZoneInfo:
+    cfg = Path("google_tz.txt")
+    if cfg.is_file():
+        name = cfg.read_text(encoding="utf-8").strip()
+        if name:
+            try:
+                return ZoneInfo(name)
+            except Exception:
+                pass
+    return ZoneInfo("America/Los_Angeles")
+
+GOOGLE_DISPLAY_TZ = _load_display_tz()
 
 try:
     from openpyxl import Workbook
@@ -570,7 +583,12 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> dict:
 
     Keys:
       - filename:       str
-      - json_date_key:  "YYYY-MM-DD" or None (the date Google currently shows)
+      - json_date_key:  "YYYY-MM-DD" or None — the date Google Photos
+                        Grid View currently shows for this file. Uses
+                        the SAME priority as repair.py's cluster folder
+                        (EXIF > filename > JSON+TZ), so the "Cluster
+                        nach Google-Datum" sheet lines up 1:1 with the
+                        output folders repair.py will create.
       - file_type:      "Foto" or "Video"
       - has_alternative: bool — True if any non-JSON, non-mtime source
                          (filename / EXIF / video metadata) produced a date.
@@ -588,9 +606,16 @@ def analyze_file(media_path: Path, temp_dir: Optional[Path] = None) -> dict:
     ext = media_path.suffix.lower()
     file_type = "Video" if ext in VIDEO_EXTENSIONS else "Foto"
 
+    # Grid-view key follows the SAME priority chain as repair.py's
+    # _resolve_cluster_folder: EXIF > filename > JSON > video metadata.
+    # Without this, the analyze report's cluster counts would disagree
+    # with what repair.py actually writes to disk.
+    grid_date = exif_date or fn_date or json_date or video_date
+    json_date_key = grid_date.strftime("%Y-%m-%d") if grid_date else None
+
     info = {
         "filename": media_path.name,
-        "json_date_key": json_date.strftime("%Y-%m-%d") if json_date else None,
+        "json_date_key": json_date_key,
         "file_type": file_type,
         "has_alternative": bool(fn_date or exif_date or video_date),
         "row": None,

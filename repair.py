@@ -116,15 +116,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_google_tz(cli_arg: str | None) -> str:
-    """CLI-Flag → google_tz.txt → Default (None = Modul-Default)."""
+def resolve_google_tz(cli_arg):
+    """CLI-Flag → google_tz.txt → None (Modul-Default).
+
+    Strips CR/LF/BOM and comments so a Windows-edited file with CRLF or a
+    UTF-8-BOM still resolves to a clean IANA name like "Europe/Berlin".
+    """
     if cli_arg:
-        return cli_arg
+        return cli_arg.strip().lstrip("﻿")
     cfg = Path("google_tz.txt")
     if cfg.is_file():
-        val = cfg.read_text(encoding="utf-8").strip()
-        if val:
-            return val
+        raw = cfg.read_text(encoding="utf-8-sig")  # strips BOM if present
+        for line in raw.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
     return None
 
 

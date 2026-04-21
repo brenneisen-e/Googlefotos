@@ -90,11 +90,17 @@ if /i "%CONFIRM%"=="j" (
 echo [5/5] Repair-Lauf wird gestartet...
 echo.
 
-:: Google-Photos-Anzeige-TZ aus google_tz.txt lesen (wenn vorhanden)
+:: Google-Photos-Anzeige-TZ aus google_tz.txt lesen (wenn vorhanden).
+:: `for /f` strippt automatisch CR, BOM und leere Zeilen — set /p dagegen
+:: liefert ggf. CR-Reste mit, was dann "--google-tz America/Los_Angeles\r"
+:: an Python uebergibt und eine ZoneInfoNotFoundError ausloest.
 setlocal enabledelayedexpansion
 set GOOGLE_TZ_ARG=
+set DETECTED_TZ=
 if exist "google_tz.txt" (
-    set /p DETECTED_TZ=<google_tz.txt
+    for /f "usebackq tokens=* delims=" %%A in ("google_tz.txt") do (
+        if not "%%A"=="" set DETECTED_TZ=%%A
+    )
     if not "!DETECTED_TZ!"=="" (
         set GOOGLE_TZ_ARG=--google-tz !DETECTED_TZ!
         echo       Nutze kalibrierte TZ: !DETECTED_TZ!

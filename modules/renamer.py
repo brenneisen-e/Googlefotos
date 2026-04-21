@@ -134,10 +134,19 @@ def _resolve_cluster_folder(
 
       4. NO_JSON_DATE_FOLDER sentinel if absolutely nothing is known.
     """
+    # Priority 1: EXIF DateTimeOriginal (local wall-clock, matches Grid view)
     exif_date = proc_result.get("exif_date")
     if exif_date and len(exif_date) >= 10:
         return exif_date[:10]
 
+    # Priority 2: Filename-embedded date (IMG_YYYYMMDD_..., PXL_..., etc.).
+    # process_file stores this as timestamp_used when source == 'filename'.
+    if proc_result.get("timestamp_source") == "filename":
+        ts_used = proc_result.get("timestamp_used")
+        if ts_used and len(ts_used) >= 10:
+            return ts_used[:10]
+
+    # Priority 3: JSON photoTakenTime (already TZ-adjusted via google_tz.txt)
     json_date = proc_result.get("json_date")
     if json_date and len(json_date) >= 10:
         return json_date[:10]
