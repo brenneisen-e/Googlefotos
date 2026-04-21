@@ -30,12 +30,33 @@ def write_repair_log(
     for pr in process_results:
         orig = pr["original_path"]
         rr = rename_map.get(orig, {})
+        new_path = rr.get("new_path") or ""
+        # The cluster folder = parent directory of the new path inside output/.
+        cluster_folder = ""
+        if new_path:
+            try:
+                cluster_folder = Path(new_path).parent.name
+            except Exception:
+                pass
+        exif_date = pr.get("exif_date", "") or ""
+        json_date = pr.get("json_date", "") or ""
+        # Derive a best-guess "Grid date" — same logic as the renamer. Lets
+        # the user filter the CSV to find files where EXIF and JSON disagree
+        # (those are the candidates for off-by-one cluster folders).
+        cluster_source = ""
+        if exif_date:
+            cluster_source = "exif"
+        elif json_date:
+            cluster_source = "json"
         rows.append({
             "original_path": orig,
             "new_filename": rr.get("new_filename", ""),
+            "cluster_folder": cluster_folder,
+            "cluster_source": cluster_source,
+            "exif_date": exif_date,
+            "json_date": json_date,
             "timestamp_used": pr.get("timestamp_used", ""),
             "timestamp_source": pr.get("timestamp_source", ""),
-            "json_date": pr.get("json_date", "") or "",
             "exif_written": str(pr.get("exif_written", False)),
             "exiftool_used": str(pr.get("exiftool_used", False)),
             "gps_written": str(pr.get("gps_written", False)),
@@ -45,8 +66,11 @@ def write_repair_log(
         })
 
     fieldnames = [
-        "original_path", "new_filename", "timestamp_used",
-        "timestamp_source", "json_date", "exif_written", "exiftool_used",
+        "original_path", "new_filename",
+        "cluster_folder", "cluster_source",
+        "exif_date", "json_date",
+        "timestamp_used", "timestamp_source",
+        "exif_written", "exiftool_used",
         "gps_written", "description_written",
         "date_mismatch", "status",
     ]

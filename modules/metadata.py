@@ -347,25 +347,147 @@ def get_metadata_from_json(json_path: Path) -> dict:
     return result
 
 
-def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
-    """Priority 3: Read existing EXIF DateTimeOriginal from the file."""
-    ext = filepath.suffix.lower()
-    if ext not in (".jpg", ".jpeg", ".tiff", ".tif"):
-        return None
+def _parse_exif_date_string(s: str) -> Optional[datetime]:
+    """Tolerant EXIF/ExifTool date parser.
 
+    EXIF stores dates in local wall-clock (no timezone) as "YYYY:MM:DD HH:MM:SS".
+    ExifTool for videos sometimes returns "YYYY:MM:DD HH:MM:SS+HH:MM" (with
+    offset) — we strip the offset so the returned datetime's DATE component
+    still represents the LOCAL wall-clock date, which is what Google Photos'
+    Grid View groups by.
+    """
+    if not s:
+        return None
+    s = s.strip().rstrip("\x00")
+    if not s or s.startswith("0000:00:00"):
+        return None
+    # Strip a trailing timezone offset like "+02:00", "-05:00", "+0200" or "Z"
+    # — we only care about the LOCAL wall-clock portion for Grid-view matching.
+    s = re.sub(r"[Zz]$", "", s)
+    s = re.sub(r"[+\-]\d{2}:?\d{2}$", "", s)
+    s = s.strip()
+    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%Y:%m:%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                "%Y:%m:%d", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            if _is_valid_timestamp(dt):
+                return dt
+        except ValueError:
+            continue
+    return None
+
+
+def _exif_date_via_piexif(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via piexif (fast, JPEG/TIFF only)."""
     try:
         exif_dict = piexif.load(str(filepath))
-        raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+    except Exception:
+        return None
+    for tag in (piexif.ExifIFD.DateTimeOriginal,
+                piexif.ExifIFD.DateTimeDigitized):
+        raw = exif_dict.get("Exif", {}).get(tag)
         if raw:
-            date_str = raw.decode("utf-8", errors="ignore").strip()
-            if date_str and date_str != "0000:00:00 00:00:00":
-                dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
-                if _is_valid_timestamp(dt):
-                    return dt, "exif_original"
+            dt = _parse_exif_date_string(raw.decode("utf-8", errors="ignore"))
+            if dt:
+                return dt
+    raw = exif_dict.get("0th", {}).get(piexif.ImageIFD.DateTime)
+    if raw:
+        dt = _parse_exif_date_string(raw.decode("utf-8", errors="ignore"))
+        if dt:
+            return dt
+    return None
+
+
+def _exif_date_via_pillow(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via Pillow (broader format support than piexif)."""
+    try:
+        with Image.open(filepath) as img:
+            exif_data = img.getexif()
+            if not exif_data:
+                return None
+            # 36867 = DateTimeOriginal, 36868 = DateTimeDigitized, 306 = DateTime
+            for tag_id in (36867, 36868, 306):
+                val = exif_data.get(tag_id)
+                if val and isinstance(val, str):
+                    dt = _parse_exif_date_string(val)
+                    if dt:
+                        return dt
     except Exception:
         pass
+    return None
+
+
+def _exif_date_via_exiftool(filepath: Path) -> Optional[datetime]:
+    """Read DateTimeOriginal via ExifTool — covers HEIC, videos, PNGs with
+    non-standard EXIF, and files where piexif/Pillow give up.
+
+    ExifTool tag priority mirrors what Google Photos itself reads:
+      DateTimeOriginal > CreateDate > MediaCreateDate > TrackCreateDate.
+    Videos (QuickTime) only have the last three. PNG/HEIC typically have
+    DateTimeOriginal via XMP or a sidecar block.
+    """
+    exiftool_path = find_exiftool()
+    if not exiftool_path:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                exiftool_path,
+                "-s", "-s", "-s",  # terse output: values only
+                "-DateTimeOriginal",
+                "-CreateDate",
+                "-MediaCreateDate",
+                "-TrackCreateDate",
+                "-api", "QuickTimeUTC=0",  # keep native (local) time for QT
+                str(filepath),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        dt = _parse_exif_date_string(line.strip())
+        if dt:
+            return dt
+    return None
+
+
+def get_timestamp_from_exif(filepath: Path) -> Optional[Tuple[datetime, str]]:
+    """Read the photo's LOCAL wall-clock date/time from embedded metadata.
+
+    Covers JPG/TIFF (piexif, fast path), PNG/WebP/GIF (Pillow), and
+    HEIC/HEIF/videos (ExifTool). Returns a UTC-tagged datetime whose DATE
+    and TIME components represent the naive local wall-clock from the
+    file — i.e. what Google Photos displays in the Grid View day header.
+    The UTC tag is a technical artifact; we never interpret the value as
+    an actual UTC instant.
+    """
+    ext = filepath.suffix.lower()
+
+    # Tier 1: piexif for JPEG/TIFF (fastest)
+    if ext in (".jpg", ".jpeg", ".tiff", ".tif"):
+        dt = _exif_date_via_piexif(filepath)
+        if dt:
+            return dt, "exif_original"
+
+    # Tier 2: Pillow — broader format coverage (PNG, WebP, GIF, some TIFFs)
+    if ext in (".jpg", ".jpeg", ".tiff", ".tif",
+               ".png", ".webp", ".gif", ".bmp"):
+        dt = _exif_date_via_pillow(filepath)
+        if dt:
+            return dt, "exif_original"
+
+    # Tier 3: ExifTool — HEIC/HEIF (XMP), videos (QuickTime), and the
+    # long tail of formats the above can't handle.
+    if ext in (".heic", ".heif", ".mp4", ".mov", ".avi", ".m4v",
+               ".mkv", ".wmv", ".flv", ".3gp",
+               ".png", ".webp", ".gif", ".jpg", ".jpeg"):
+        dt = _exif_date_via_exiftool(filepath)
+        if dt:
+            return dt, "exif_original"
 
     return None
 
