@@ -248,22 +248,35 @@ def _resolve_cluster_folder(
 
       4. NO_JSON_DATE_FOLDER sentinel if absolutely nothing is known.
     """
-    # Priority 1: EXIF DateTimeOriginal (local wall-clock, matches Grid view)
+    # Priority 1: EXIF DateTimeOriginal — the camera's local wall-clock
+    # which Google reads as its primary Grid-view date source.
     exif_date = proc_result.get("exif_date")
     if exif_date and len(exif_date) >= 10:
         return exif_date[:10]
 
-    # Priority 2: Filename-embedded date (IMG_YYYYMMDD_..., PXL_..., etc.).
-    # process_file stores this as timestamp_used when source == 'filename'.
+    # Priority 2: JSON photoTakenTime — already converted via the
+    # configured TZ (google_tz.txt, default Pacific) when read by
+    # metadata.get_timestamp_from_json. This is the correct fallback
+    # for EXIF-less files because Google itself computes Grid dates
+    # from the same timestamp in its server TZ. Notable case: WhatsApp
+    # photos (IMG-YYYYMMDD-WAxxxx.jpg) have no EXIF, so the filename
+    # parses to the local upload date (e.g. 12.03.) while Google
+    # actually groups them under the UTC/Pacific date of the upload
+    # moment (e.g. 11.03. — the message was sent just after midnight
+    # Berlin time). Filename-based clustering would always mismatch
+    # by one day for such files — JSON wins.
+    json_date = proc_result.get("json_date")
+    if json_date and len(json_date) >= 10:
+        return json_date[:10]
+
+    # Priority 3: Filename-embedded date — only used when neither EXIF
+    # nor JSON gave us a date (rare: JSON-less scan from a very old
+    # Takeout export, or a file the matcher couldn't pair). Strictly
+    # inferior to JSON for Grid-matching but better than giving up.
     if proc_result.get("timestamp_source") == "filename":
         ts_used = proc_result.get("timestamp_used")
         if ts_used and len(ts_used) >= 10:
             return ts_used[:10]
-
-    # Priority 3: JSON photoTakenTime (already TZ-adjusted via google_tz.txt)
-    json_date = proc_result.get("json_date")
-    if json_date and len(json_date) >= 10:
-        return json_date[:10]
 
     if json_path:
         try:
