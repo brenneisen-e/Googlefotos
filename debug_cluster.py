@@ -33,8 +33,10 @@ from modules.metadata import (
     get_timestamp_from_exif,
     ALL_IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    process_file,
 )
 from modules.matcher import find_json_for_media
+from modules.renamer import _resolve_cluster_folder, build_new_filename
 
 MEDIA_EXTS = ALL_IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | {
     ".gif", ".bmp", ".raw", ".cr2", ".nef", ".arw", ".dng",
@@ -164,6 +166,32 @@ def dump_file(mf: Path, temp_root: Path, json_path, out_lines: list):
                 out_lines.append(f"  {field:30s}: lat={g['lat']} lon={g['lon']}")
     else:
         out_lines.append("JSON gefunden   : NEIN")
+
+    # ------------------------------------------------------------------
+    # Was das Tool JETZT aktuell entscheiden würde (EXIF > JSON > Filename)
+    # ------------------------------------------------------------------
+    try:
+        proc = process_file(mf, json_path) if json_path else process_file(mf, None)
+        cluster = _resolve_cluster_folder(proc, json_path)
+        try:
+            dt_used = datetime.strptime(
+                proc.get("timestamp_used") or "1970-01-01 00:00:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            new_name = build_new_filename(mf, dt_used)
+        except Exception:
+            new_name = "(n/a)"
+        out_lines.append("")
+        out_lines.append(f"TOOL-ENTSCHEIDUNG (nach aktueller Priorität):")
+        out_lines.append(f"  cluster_folder : {cluster}")
+        out_lines.append(f"  new_filename   : {new_name}")
+        out_lines.append(f"  source of pick : "
+                         f"exif={proc.get('exif_date') or '-'}   "
+                         f"json={proc.get('json_date') or '-'}   "
+                         f"write-ts-source={proc.get('timestamp_source')}")
+    except Exception as e:
+        out_lines.append("")
+        out_lines.append(f"TOOL-ENTSCHEIDUNG: Fehler beim Simulieren — {e}")
 
     out_lines.append("")
 
