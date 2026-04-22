@@ -250,29 +250,42 @@ def _resolve_cluster_folder(
     """
     # Priority 1: EXIF DateTimeOriginal — the camera's local wall-clock
     # which Google reads as its primary Grid-view date source.
+    #
+    # Exception: synthetic midnight EXIF (WhatsApp and some backup tools
+    # stamp EXIF as "YYYY-MM-DD 00:00:00" using the message-received day
+    # rather than the actual capture moment). Google Photos recognises
+    # these as unreliable and falls back to the JSON photoTakenTime for
+    # Grid grouping — so must we. A real camera basically never writes
+    # EXIF time with exactly 00:00:00, so the heuristic "EXIF time ==
+    # 00:00:00 AND JSON is present" is a safe synthetic-EXIF detector.
+    # Without this, a WhatsApp IMG-20140312-WAxxxx.jpg with EXIF at
+    # 2014-03-12 00:00:00 but a real JSON timestamp of 11.03.2014 23:34
+    # UTC lands in output/2014-03-12/ while Google Grid shows it under
+    # 11.03.
     exif_date = proc_result.get("exif_date")
-    if exif_date and len(exif_date) >= 10:
+    json_date = proc_result.get("json_date")
+    exif_is_synthetic = bool(
+        exif_date and exif_date.endswith(" 00:00:00") and json_date
+    )
+    if exif_date and not exif_is_synthetic and len(exif_date) >= 10:
         return exif_date[:10]
 
     # Priority 2: JSON photoTakenTime — already converted via the
     # configured TZ (google_tz.txt, default Pacific) when read by
     # metadata.get_timestamp_from_json. This is the correct fallback
-    # for EXIF-less files because Google itself computes Grid dates
-    # from the same timestamp in its server TZ. Notable case: WhatsApp
-    # photos (IMG-YYYYMMDD-WAxxxx.jpg) have no EXIF, so the filename
-    # parses to the local upload date (e.g. 12.03.) while Google
-    # actually groups them under the UTC/Pacific date of the upload
-    # moment (e.g. 11.03. — the message was sent just after midnight
-    # Berlin time). Filename-based clustering would always mismatch
-    # by one day for such files — JSON wins.
-    json_date = proc_result.get("json_date")
+    # for EXIF-less files AND for files with synthetic midnight EXIF
+    # (WhatsApp), because Google itself computes Grid dates from the
+    # same timestamp in its server TZ.
     if json_date and len(json_date) >= 10:
         return json_date[:10]
 
+    # Priority 2b: If EXIF was synthetic but JSON is ALSO missing, fall
+    # back to the synthetic EXIF anyway — better than no cluster at all.
+    if exif_date and len(exif_date) >= 10:
+        return exif_date[:10]
+
     # Priority 3: Filename-embedded date — only used when neither EXIF
-    # nor JSON gave us a date (rare: JSON-less scan from a very old
-    # Takeout export, or a file the matcher couldn't pair). Strictly
-    # inferior to JSON for Grid-matching but better than giving up.
+    # nor JSON gave us a date.
     if proc_result.get("timestamp_source") == "filename":
         ts_used = proc_result.get("timestamp_used")
         if ts_used and len(ts_used) >= 10:
